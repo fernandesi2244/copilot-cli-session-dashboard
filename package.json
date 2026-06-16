@@ -1,0 +1,7 @@
+{
+  "name": "session-dashboard",
+  "version": "1.0.0",
+  "description": "Live web dashboard for monitoring and managing Copilot CLI sessions",
+  "main": "extension.mjs",
+  "type": "module"
+}
