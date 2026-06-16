@@ -2,7 +2,7 @@
 
 A single-file [GitHub Copilot CLI extension](https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli) that runs a local web dashboard for monitoring and managing all your concurrent Copilot CLI sessions.
 
-> ⚠️ **Note:** This is a personal project I built before the official GitHub Copilot desktop app shipped its own session management UI. It is **not** intended to replicate or compete with the Copilot app — it just scratches some different itches I had around multi-session workflows, workspace persistence, and AI-organized todos. Sharing in case any of it is useful to others.
+> ⚠️ **Note:** This is a personal project I built before the official GitHub Copilot desktop app shipped its own session management UI. It is **not** intended to replicate or compete with the Copilot app — it just solves some different problems I had around multi-session workflows, workspace persistence, and AI-organized todos. Sharing in case any of it is useful to others.
 
 > 🪟 **Platform:** Windows-first (uses Windows Terminal `wt` for tab launching and PowerShell for some helpers). The web dashboard itself works cross-platform, but tab-launching features require Windows Terminal. PRs to broaden platform support are welcome.
 
