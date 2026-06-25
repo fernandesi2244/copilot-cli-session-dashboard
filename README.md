@@ -6,6 +6,8 @@ A single-file [GitHub Copilot CLI extension](https://docs.github.com/en/copilot/
 
 > 🪟 **Platform:** Windows-first (uses Windows Terminal `wt` for tab launching and PowerShell for some helpers). The web dashboard itself works cross-platform, but tab-launching features require Windows Terminal. PRs to broaden platform support are welcome.
 
+![Copilot Sessions Monitor dashboard preview](docs/dashboard-preview.png)
+
 ## Features
 
 ### 🖥️ Live Multi-Session Monitor (main page)
