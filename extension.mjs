@@ -6,7 +6,7 @@ import { createServer } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { joinSession } from "@github/copilot-sdk/extension";
 import { exec, spawn, execSync } from "node:child_process";
-import { readdirSync, readFileSync, existsSync, statSync, writeFileSync, renameSync, mkdirSync, unlinkSync, rmSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, statSync, writeFileSync, renameSync, mkdirSync, unlinkSync, rmSync, openSync, readSync, closeSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 
@@ -20,11 +20,26 @@ const WORKSPACE_FILE = join(homedir(), ".copilot", "saved-workspace.json");
 const TODOS_FILE = join(homedir(), ".copilot", "session-dashboard-todos.json");
 const CONFIG_FILE = join(homedir(), ".copilot", "session-dashboard-config.json");
 
+let _configCache = null;
+let _configCacheTime = 0;
+const CONFIG_CACHE_TTL_MS = 30000; // 30 seconds
+
 function loadDashboardConfig() {
+    const now = Date.now();
+    if (_configCache && (now - _configCacheTime) < CONFIG_CACHE_TTL_MS) {
+        return _configCache;
+    }
     try {
-        if (existsSync(CONFIG_FILE)) return JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) || {};
-    } catch {}
-    return {};
+        if (existsSync(CONFIG_FILE)) {
+            _configCache = JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) || {};
+        } else {
+            _configCache = {};
+        }
+    } catch {
+        _configCache = {};
+    }
+    _configCacheTime = now;
+    return _configCache;
 }
 
 function resolveUserAlias() {
@@ -65,6 +80,46 @@ let screenBlankActive = false; // guard against double-spawning
 let lockFlowActive = false; // guard against duplicate screen-dismissed calls
 const LOCK_COUNTDOWN_SEC = 3;
 const INTRUSION_FILE = join(homedir(), ".copilot", "session-dashboard-intrusion.json");
+
+// --- Performance: HTML template cache (generated once, never changes) ---
+const _htmlCache = {};
+function cachedHtml(name, generator) {
+    if (!_htmlCache[name]) _htmlCache[name] = generator();
+    return _htmlCache[name];
+}
+
+// --- Performance: session scan cache ---
+let _scanCache = null;
+let _scanCacheTime = 0;
+const SCAN_CACHE_TTL_MS = 2000; // 2 seconds
+
+function getCachedSessions(forceRefresh = false) {
+    const now = Date.now();
+    if (!forceRefresh && _scanCache && (now - _scanCacheTime) < SCAN_CACHE_TTL_MS) {
+        return _scanCache;
+    }
+    _scanCache = _scanSessionsUncached();
+    _scanCacheTime = now;
+    return _scanCache;
+}
+
+function invalidateSessionCache() {
+    _scanCache = null;
+    _scanCacheTime = 0;
+}
+
+// Per-session events cache: avoids re-reading events.jsonl if mtime hasn't changed
+const _sessionEventsCache = new Map(); // sessionId -> { mtimeMs, rawEvents, lastEvents, progressInfo }
+
+function sendJson(res, data, statusCode = 200, extraHeaders = {}) {
+    const body = typeof data === "string" ? data : JSON.stringify(data);
+    res.writeHead(statusCode, {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+        ...extraHeaders,
+    });
+    res.end(body);
+}
 
 // --- Report generation (reads session history from disk on demand) ---
 const REPORTS_DIR = join(homedir(), ".copilot", "activity", "reports");
@@ -127,7 +182,19 @@ function getSessionsInRange(startDate, endDate) {
             // If events file was last modified before the range start, no activity in range
             if (evStat.mtime < startDate && !createdInRange && !updatedInRange) continue;
 
-            const raw = readFileSync(eventsPath, "utf-8");
+            // Reuse per-session events cache if available and fresh
+            const cached = _sessionEventsCache.get(name);
+            let raw;
+            try {
+                const evMtime = statSync(eventsPath).mtimeMs;
+                if (cached && cached.mtimeMs === evMtime && cached.rawEvents) {
+                    raw = cached.rawEvents;
+                } else {
+                    raw = readFileSync(eventsPath, "utf-8");
+                }
+            } catch {
+                raw = readFileSync(eventsPath, "utf-8");
+            }
             events = raw.trim().split("\n").map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
         } catch {}
 
@@ -585,8 +652,22 @@ function parseYaml(text) {
     return obj;
 }
 
+// Cache process-alive checks per scan cycle (cleared every 2s with session cache)
+let _pidAliveCache = new Map();
+let _pidAliveCacheTime = 0;
+
 function isProcessAlive(pid) {
-    try { process.kill(Number(pid), 0); return true; } catch { return false; }
+    const now = Date.now();
+    if (now - _pidAliveCacheTime > 2000) {
+        _pidAliveCache.clear();
+        _pidAliveCacheTime = now;
+    }
+    const key = Number(pid);
+    if (_pidAliveCache.has(key)) return _pidAliveCache.get(key);
+    let alive;
+    try { process.kill(key, 0); alive = true; } catch { alive = false; }
+    _pidAliveCache.set(key, alive);
+    return alive;
 }
 
 function deriveStatus(lastEvents, lockPid, isAlive) {
@@ -694,7 +775,7 @@ function deriveStatus(lastEvents, lockPid, isAlive) {
     return { status: "active", label: "Active", icon: "🟢" };
 }
 
-function getProgressSummary(dir, eventsPath) {
+function getProgressSummary(dir, eventsPath, preReadRaw) {
     // 1. Read plan.md
     let planContent = "";
     let planGoal = "";
@@ -732,7 +813,33 @@ function getProgressSummary(dir, eventsPath) {
     let latestIntent = "";
     let lastTurnEndLine = -1, lastUserMsgLine = -1;
     try {
-        const raw = readFileSync(eventsPath, "utf-8");
+        let raw;
+        if (preReadRaw) {
+            raw = preReadRaw;
+        } else {
+            // For large files, only read the tail to avoid I/O bottlenecks
+            const TAIL_BYTES = 256 * 1024;
+            try {
+                const st = statSync(eventsPath);
+                if (st.size > TAIL_BYTES) {
+                    const fd = openSync(eventsPath, "r");
+                    try {
+                        const buf = Buffer.alloc(TAIL_BYTES);
+                        readSync(fd, buf, 0, TAIL_BYTES, st.size - TAIL_BYTES);
+                        raw = buf.toString("utf-8");
+                    } finally {
+                        closeSync(fd);
+                    }
+                    // Strip partial first line
+                    const nlIdx = raw.indexOf("\n");
+                    if (nlIdx > 0) raw = raw.slice(nlIdx + 1);
+                } else {
+                    raw = readFileSync(eventsPath, "utf-8");
+                }
+            } catch {
+                raw = readFileSync(eventsPath, "utf-8");
+            }
+        }
         const lines = raw.trim().split("\n");
         for (let li = 0; li < lines.length; li++) {
             const line = lines[li];
@@ -851,7 +958,7 @@ function getProgressSummary(dir, eventsPath) {
     };
 }
 
-function scanSessions() {
+function _scanSessionsUncached() {
     const results = [];
     if (!existsSync(SESSION_STATE_DIR)) return results;
 
@@ -893,13 +1000,26 @@ function scanSessions() {
             }
         } catch {}
 
-        // Read last N events
+        // Read events file ONCE — share between status derivation and progress summary
+        // Use mtime-based caching to avoid re-reading unchanged files
+        let rawEvents = "";
         let lastEvents = [];
-        try {
-            const raw = readFileSync(eventsPath, "utf-8");
-            const lines = raw.trim().split("\n").slice(-25);
-            lastEvents = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-        } catch {}
+        let progressInfo;
+        let evMtimeMs = 0;
+        try { evMtimeMs = statSync(eventsPath).mtimeMs; } catch {}
+
+        const cached = _sessionEventsCache.get(name);
+        if (cached && cached.mtimeMs === evMtimeMs && evMtimeMs > 0) {
+            // File hasn't changed — reuse cached parse results
+            rawEvents = cached.rawEvents;
+            lastEvents = cached.lastEvents;
+        } else {
+            try { rawEvents = readFileSync(eventsPath, "utf-8"); } catch {}
+            if (rawEvents) {
+                const lines = rawEvents.trimEnd().split("\n").slice(-25);
+                lastEvents = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            }
+        }
 
         const statusInfo = deriveStatus(lastEvents, lockPid, isAlive);
 
@@ -910,8 +1030,27 @@ function scanSessions() {
             if (last.timestamp) lastActivity = last.timestamp;
         }
 
-        // Get progress summary
-        const progressInfo = getProgressSummary(dir, eventsPath);
+        // For inactive sessions older than 24h, skip expensive progress summary
+        const SKIP_PROGRESS_AGE_MS = 24 * 60 * 60 * 1000;
+        const isOldInactive = !isAlive && lastActivity &&
+            (Date.now() - new Date(lastActivity).getTime()) > SKIP_PROGRESS_AGE_MS;
+
+        if (isOldInactive) {
+            progressInfo = {
+                goal: "", stage: "", progressNote: "", planContent: "",
+                recentConversation: "", latestIntent: "", unseen: false,
+                turns: 0, toolCalls: 0, taskCompletes: 0, errors: 0,
+                permissionRequests: 0, firstEventTime: null, lastEventTime: lastActivity,
+            };
+        } else if (cached && cached.mtimeMs === evMtimeMs && evMtimeMs > 0 && cached.progressInfo) {
+            // Reuse cached progress info if file hasn't changed
+            progressInfo = cached.progressInfo;
+        } else {
+            progressInfo = getProgressSummary(dir, eventsPath, rawEvents);
+        }
+
+        // Update per-session cache
+        _sessionEventsCache.set(name, { mtimeMs: evMtimeMs, rawEvents, lastEvents, progressInfo });
 
         results.push({
             id: name,
@@ -938,6 +1077,10 @@ function scanSessions() {
     return results;
 }
 
+function scanSessions() {
+    return getCachedSessions();
+}
+
 // --- Repo scanning ---
 
 const REPO_SCAN_DIRS = (() => {
@@ -962,7 +1105,11 @@ const REPO_SCAN_DIRS = (() => {
     return all;
 })();
 
-function scanRepos() {
+let _repoCache = null;
+let _repoCacheTime = 0;
+const REPO_CACHE_TTL_MS = 30000; // 30 seconds
+
+function _scanReposUncached() {
     const repos = [];
     const seen = new Set();
 
@@ -1018,25 +1165,57 @@ function scanRepos() {
     return repos;
 }
 
+function scanRepos() {
+    const now = Date.now();
+    if (_repoCache && (now - _repoCacheTime) < REPO_CACHE_TTL_MS) {
+        return _repoCache;
+    }
+    _repoCache = _scanReposUncached();
+    _repoCacheTime = now;
+    return _repoCache;
+}
+
 // --- Notes helpers ---
+let _notesCache = null;
+let _notesCacheTime = 0;
+const NOTES_CACHE_TTL_MS = 5000;
+
 function loadNotes() {
+    const now = Date.now();
+    if (_notesCache && (now - _notesCacheTime) < NOTES_CACHE_TTL_MS) return _notesCache;
     try {
-        if (existsSync(NOTES_FILE)) return JSON.parse(readFileSync(NOTES_FILE, "utf-8"));
+        if (existsSync(NOTES_FILE)) {
+            _notesCache = JSON.parse(readFileSync(NOTES_FILE, "utf-8"));
+            _notesCacheTime = now;
+            return _notesCache;
+        }
     } catch {}
-    return {};
+    _notesCache = {};
+    _notesCacheTime = now;
+    return _notesCache;
 }
 function saveNotes(notes) {
     try { writeFileSync(NOTES_FILE, JSON.stringify(notes, null, 2)); } catch {}
+    _notesCache = notes;
+    _notesCacheTime = Date.now();
 }
 
 // --- Analytics data computation ---
+let _analyticsCache = null;
+let _analyticsCacheTime = 0;
+const ANALYTICS_CACHE_TTL_MS = 10000; // 10 seconds
+
 function computeAnalyticsData() {
+    const now = Date.now();
+    if (_analyticsCache && (now - _analyticsCacheTime) < ANALYTICS_CACHE_TTL_MS) {
+        return _analyticsCache;
+    }
     const sessions = scanSessions();
     // Sessions per day (last 14 days)
     const perDay = {};
-    const now = new Date();
+    const nowDate = new Date();
     for (let i = 13; i >= 0; i--) {
-        const d = new Date(now); d.setDate(d.getDate() - i);
+        const d = new Date(nowDate); d.setDate(d.getDate() - i);
         perDay[d.toISOString().slice(0, 10)] = 0;
     }
     let totalTurns = 0, totalTools = 0, totalDuration = 0, durationCount = 0;
@@ -1055,7 +1234,9 @@ function computeAnalyticsData() {
     }
     const topRepos = Object.entries(repoCount).sort((a, b) => b[1] - a[1]).slice(0, 10);
     const avgDuration = durationCount > 0 ? Math.round(totalDuration / durationCount / 60000) : 0;
-    return { perDay, topRepos, totalSessions: sessions.length, totalTurns, totalTools, avgDuration };
+    _analyticsCache = { perDay, topRepos, totalSessions: sessions.length, totalTurns, totalTools, avgDuration };
+    _analyticsCacheTime = now;
+    return _analyticsCache;
 }
 
 // --- HTML Dashboard ---
@@ -2621,14 +2802,26 @@ function uuid() {
     return "t-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
 }
 
+let _todosCache = null;
+let _todosCacheTime = 0;
+const TODOS_CACHE_TTL_MS = 5000;
+
 function loadTodos() {
+    const now = Date.now();
+    if (_todosCache && (now - _todosCacheTime) < TODOS_CACHE_TTL_MS) return _todosCache;
     try {
         if (existsSync(TODOS_FILE)) {
             const data = JSON.parse(readFileSync(TODOS_FILE, "utf-8"));
-            if (data && Array.isArray(data.categories)) return data;
+            if (data && Array.isArray(data.categories)) {
+                _todosCache = data;
+                _todosCacheTime = now;
+                return data;
+            }
         }
     } catch {}
-    return { version: 1, categories: [] };
+    _todosCache = { version: 1, categories: [] };
+    _todosCacheTime = now;
+    return _todosCache;
 }
 
 function saveTodos(data) {
@@ -2636,6 +2829,8 @@ function saveTodos(data) {
         const tmp = TODOS_FILE + ".tmp";
         writeFileSync(tmp, JSON.stringify(data, null, 2));
         renameSync(tmp, TODOS_FILE);
+        _todosCache = data;
+        _todosCacheTime = Date.now();
         return true;
     } catch { return false; }
 }
@@ -4072,10 +4267,9 @@ function autoSaveWorkspace() {
         // Guard #3: only rotate backups when the session list actually
         // changes; otherwise we'd churn 10 identical snapshots per 10 minutes.
         let sameSessions = false;
-        if (prevSessions) {
-            try {
-                sameSessions = JSON.stringify(prevSessions) === JSON.stringify(saved);
-            } catch {}
+        if (prevSessions && prevSessions.length === saved.length) {
+            // Quick comparison: check if session IDs are identical (ordered)
+            sameSessions = prevSessions.every((ps, i) => ps.sessionId === saved[i]?.sessionId);
         }
         if (!sameSessions) rotateWorkspaceBackups();
 
@@ -4611,13 +4805,11 @@ const server = createServer((req, res) => {
     }
     if (req.url === "/api/sessions") {
         const sessions = scanSessions();
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(sessions));
+        sendJson(res, sessions);
         return;
     }
     if (req.url === "/api/repos") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(scanRepos()));
+        sendJson(res, scanRepos());
         return;
     }
     if (req.url === "/api/resume" && req.method === "POST") {
@@ -4754,41 +4946,22 @@ const server = createServer((req, res) => {
     if (req.url === "/api/stale-sessions") {
         const stale = [];
         const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
-        if (existsSync(SESSION_STATE_DIR)) {
-            try {
-                const dirs = readdirSync(SESSION_STATE_DIR);
-                for (const name of dirs) {
-                    const dir = join(SESSION_STATE_DIR, name);
-                    try { if (!statSync(dir).isDirectory()) continue; } catch { continue; }
-                    // Check if alive
-                    let alive = false;
-                    try {
-                        const files = readdirSync(dir);
-                        const locks = files.filter(f => f.startsWith("inuse.") && f.endsWith(".lock"));
-                        for (const lock of locks) {
-                            const pid = lock.replace("inuse.", "").replace(".lock", "");
-                            if (isProcessAlive(pid)) { alive = true; break; }
-                        }
-                    } catch {}
-                    if (alive) continue;
-                    // Check age
-                    try {
-                        const st = statSync(dir);
-                        if (Date.now() - st.mtimeMs > THIRTY_DAYS) {
-                            // Estimate size
-                            let size = 0;
-                            try {
-                                const files = readdirSync(dir);
-                                for (const f of files) { try { size += statSync(join(dir, f)).size; } catch {} }
-                            } catch {}
-                            stale.push({ id: name, age: Math.round((Date.now() - st.mtimeMs) / 86400000), size });
-                        }
-                    } catch {}
-                }
-            } catch {}
+        const sessions = scanSessions();
+        for (const s of sessions) {
+            if (s.alive) continue;
+            const lastTime = s.updatedAt ? new Date(s.updatedAt).getTime() : 0;
+            if (lastTime && (Date.now() - lastTime) > THIRTY_DAYS) {
+                // Only compute size on demand (this is a rarely-called endpoint)
+                let size = 0;
+                const dir = join(SESSION_STATE_DIR, s.id);
+                try {
+                    const files = readdirSync(dir);
+                    for (const f of files) { try { size += statSync(join(dir, f)).size; } catch {} }
+                } catch {}
+                stale.push({ id: s.id, age: Math.round((Date.now() - lastTime) / 86400000), size });
+            }
         }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(stale));
+        sendJson(res, stale);
         return;
     }
     if (req.url === "/api/cleanup" && req.method === "POST") {
@@ -4813,24 +4986,22 @@ const server = createServer((req, res) => {
     }
     // --- Feature 10: Analytics data ---
     if (req.url === "/api/analytics-data") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(computeAnalyticsData()));
+        sendJson(res, computeAnalyticsData());
         return;
     }
     if (req.url === "/analytics") {
         res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(analyticsHtml());
+        res.end(cachedHtml("analytics", analyticsHtml));
         return;
     }
     // --- Todos feature ---
     if (req.url === "/todos") {
         res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(todosHtml());
+        res.end(cachedHtml("todos", todosHtml));
         return;
     }
     if (req.url === "/api/todos" && req.method === "GET") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(loadTodos()));
+        sendJson(res, loadTodos());
         return;
     }
     if (req.url === "/api/todos/save" && req.method === "POST") {
@@ -5367,11 +5538,11 @@ const server = createServer((req, res) => {
     }
     if (req.url === "/reports") {
         res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(reportsHtml());
+        res.end(cachedHtml("reports", reportsHtml));
         return;
     }
     res.writeHead(200, { "Content-Type": "text/html" });
-    res.end(dashboardHtml());
+    res.end(cachedHtml("dashboard", dashboardHtml));
 });
 
 // Start server on preferred port, fall back to random if in use
@@ -5396,12 +5567,18 @@ await new Promise((resolve, reject) => {
 });
 
 // Periodic push of session state to all SSE clients
+let _lastSsePayload = "";
+let _lastSseCacheRef = null;
 setInterval(() => {
     if (sseClients.size === 0) return;
     const sessions = scanSessions();
-    const data = JSON.stringify(sessions);
+    // Avoid re-serializing if the cache reference hasn't changed
+    if (sessions !== _lastSseCacheRef) {
+        _lastSsePayload = `data: ${JSON.stringify(sessions)}\n\n`;
+        _lastSseCacheRef = sessions;
+    }
     for (const res of sseClients) {
-        try { res.write(`data: ${data}\n\n`); } catch {}
+        try { res.write(_lastSsePayload); } catch {}
     }
 }, POLL_INTERVAL_MS);
 
