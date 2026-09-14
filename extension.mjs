@@ -108,8 +108,8 @@ function invalidateSessionCache() {
     _scanCacheTime = 0;
 }
 
-// Per-session events cache: avoids re-reading events.jsonl if mtime hasn't changed
-const _sessionEventsCache = new Map(); // sessionId -> { mtimeMs, rawEvents, lastEvents, progressInfo }
+// Per-session events cache: retain only compact derived data, never full event logs.
+const _sessionEventsCache = new Map(); // sessionId -> { mtimeMs, lastEvents, progressInfo }
 
 function sendJson(res, data, statusCode = 200, extraHeaders = {}) {
     const body = typeof data === "string" ? data : JSON.stringify(data);
@@ -182,19 +182,7 @@ function getSessionsInRange(startDate, endDate) {
             // If events file was last modified before the range start, no activity in range
             if (evStat.mtime < startDate && !createdInRange && !updatedInRange) continue;
 
-            // Reuse per-session events cache if available and fresh
-            const cached = _sessionEventsCache.get(name);
-            let raw;
-            try {
-                const evMtime = statSync(eventsPath).mtimeMs;
-                if (cached && cached.mtimeMs === evMtime && cached.rawEvents) {
-                    raw = cached.rawEvents;
-                } else {
-                    raw = readFileSync(eventsPath, "utf-8");
-                }
-            } catch {
-                raw = readFileSync(eventsPath, "utf-8");
-            }
+            const raw = readFileSync(eventsPath, "utf-8");
             events = raw.trim().split("\n").map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
         } catch {}
 
@@ -775,7 +763,23 @@ function deriveStatus(lastEvents, lockPid, isAlive) {
     return { status: "active", label: "Active", icon: "🟢" };
 }
 
-function getProgressSummary(dir, eventsPath, preReadRaw) {
+function readEventTail(eventsPath, maxBytes = 256 * 1024) {
+    const st = statSync(eventsPath);
+    if (st.size <= maxBytes) return readFileSync(eventsPath, "utf-8");
+
+    const fd = openSync(eventsPath, "r");
+    try {
+        const buf = Buffer.alloc(maxBytes);
+        readSync(fd, buf, 0, maxBytes, st.size - maxBytes);
+        const raw = buf.toString("utf-8");
+        const newlineIndex = raw.indexOf("\n");
+        return newlineIndex >= 0 ? raw.slice(newlineIndex + 1) : "";
+    } finally {
+        closeSync(fd);
+    }
+}
+
+function getProgressSummary(dir, eventsPath, preReadTail) {
     // 1. Read plan.md
     let planContent = "";
     let planGoal = "";
@@ -814,28 +818,11 @@ function getProgressSummary(dir, eventsPath, preReadRaw) {
     let lastTurnEndLine = -1, lastUserMsgLine = -1;
     try {
         let raw;
-        if (preReadRaw) {
-            raw = preReadRaw;
+        if (preReadTail) {
+            raw = preReadTail;
         } else {
-            // For large files, only read the tail to avoid I/O bottlenecks
-            const TAIL_BYTES = 256 * 1024;
             try {
-                const st = statSync(eventsPath);
-                if (st.size > TAIL_BYTES) {
-                    const fd = openSync(eventsPath, "r");
-                    try {
-                        const buf = Buffer.alloc(TAIL_BYTES);
-                        readSync(fd, buf, 0, TAIL_BYTES, st.size - TAIL_BYTES);
-                        raw = buf.toString("utf-8");
-                    } finally {
-                        closeSync(fd);
-                    }
-                    // Strip partial first line
-                    const nlIdx = raw.indexOf("\n");
-                    if (nlIdx > 0) raw = raw.slice(nlIdx + 1);
-                } else {
-                    raw = readFileSync(eventsPath, "utf-8");
-                }
+                raw = readEventTail(eventsPath);
             } catch {
                 raw = readFileSync(eventsPath, "utf-8");
             }
@@ -1000,9 +987,8 @@ function _scanSessionsUncached() {
             }
         } catch {}
 
-        // Read events file ONCE — share between status derivation and progress summary
-        // Use mtime-based caching to avoid re-reading unchanged files
-        let rawEvents = "";
+        // Read only a bounded tail and cache compact derived data.
+        let eventTail = "";
         let lastEvents = [];
         let progressInfo;
         let evMtimeMs = 0;
@@ -1011,12 +997,11 @@ function _scanSessionsUncached() {
         const cached = _sessionEventsCache.get(name);
         if (cached && cached.mtimeMs === evMtimeMs && evMtimeMs > 0) {
             // File hasn't changed — reuse cached parse results
-            rawEvents = cached.rawEvents;
             lastEvents = cached.lastEvents;
         } else {
-            try { rawEvents = readFileSync(eventsPath, "utf-8"); } catch {}
-            if (rawEvents) {
-                const lines = rawEvents.trimEnd().split("\n").slice(-25);
+            try { eventTail = readEventTail(eventsPath); } catch {}
+            if (eventTail) {
+                const lines = eventTail.trimEnd().split("\n").slice(-25);
                 lastEvents = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
             }
         }
@@ -1046,11 +1031,11 @@ function _scanSessionsUncached() {
             // Reuse cached progress info if file hasn't changed
             progressInfo = cached.progressInfo;
         } else {
-            progressInfo = getProgressSummary(dir, eventsPath, rawEvents);
+            progressInfo = getProgressSummary(dir, eventsPath, eventTail);
         }
 
         // Update per-session cache
-        _sessionEventsCache.set(name, { mtimeMs: evMtimeMs, rawEvents, lastEvents, progressInfo });
+        _sessionEventsCache.set(name, { mtimeMs: evMtimeMs, lastEvents, progressInfo });
 
         results.push({
             id: name,
