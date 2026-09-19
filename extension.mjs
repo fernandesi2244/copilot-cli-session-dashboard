@@ -18,6 +18,7 @@ let mainSession = null; // set after joinSession
 const NOTES_FILE = join(homedir(), ".copilot", "session-dashboard-notes.json");
 const WORKSPACE_FILE = join(homedir(), ".copilot", "saved-workspace.json");
 const TODOS_FILE = join(homedir(), ".copilot", "session-dashboard-todos.json");
+const INVESTIGATIONS_FILE = join(homedir(), ".copilot", "session-dashboard-investigations.json");
 const CONFIG_FILE = join(homedir(), ".copilot", "session-dashboard-config.json");
 
 let _configCache = null;
@@ -1185,6 +1186,16 @@ function saveNotes(notes) {
     _notesCacheTime = Date.now();
 }
 
+function loadInvestigations() {
+    try {
+        if (existsSync(INVESTIGATIONS_FILE)) {
+            const data = JSON.parse(readFileSync(INVESTIGATIONS_FILE, "utf-8"));
+            if (data && Array.isArray(data.items)) return data;
+        }
+    } catch {}
+    return { version: 1, updatedAt: null, items: [] };
+}
+
 // --- Analytics data computation ---
 let _analyticsCache = null;
 let _analyticsCacheTime = 0;
@@ -1742,6 +1753,7 @@ function dashboardHtml() {
   <button class="header-btn" id="screenBlankBtn" title="Blank all screens (click/key/mouse to dismiss)">&#x1f5a5;&#xfe0f;</button>
   <button class="header-btn" id="cancelLockBtn" title="Cancel computer lock" style="display:none;background:#b62324;color:#fff;border-color:#b62324;font-weight:700;min-width:90px;">🔓 3s</button>
   <button class="header-btn" id="cleanupBtn" title="Clean up stale sessions">🧹</button>
+  <a href="/investigations" class="header-btn" title="Live investigations and resumable incident sessions" style="text-decoration:none;">🔎</a>
   <a href="/analytics" class="header-btn" title="Session analytics" style="text-decoration:none;">📊</a>
   <a href="/todos" class="header-btn" title="Todos — AI-organized task list with worktree launcher" style="text-decoration:none;">📝</a>
   <a href="/reports" class="header-btn" title="Weekly &amp; monthly activity reports" style="text-decoration:none;">📋</a>
@@ -2777,6 +2789,168 @@ es.onmessage = (e) => { try { render(JSON.parse(e.data)); } catch {} };
 
 // Initial load
 fetch("/api/sessions").then(r => r.json()).then(render);
+</script>
+</body>
+</html>`;
+}
+
+// --- Investigations HTML page ---
+function investigationsHtml() {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Investigations — Copilot</title>
+<style>
+  :root, [data-theme="dark"] {
+    --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3;
+    --dim:#8b949e; --blue:#58a6ff; --green:#3fb950; --yellow:#e3b341;
+    --red:#f85149; --purple:#bc8cff;
+  }
+  [data-theme="light"] {
+    --bg:#f6f8fa; --card:#fff; --border:#d0d7de; --text:#1f2328;
+    --dim:#656d76; --blue:#0969da; --green:#1a7f37; --yellow:#9a6700;
+    --red:#cf222e; --purple:#8250df;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:'Segoe UI',-apple-system,sans-serif; background:var(--bg); color:var(--text); }
+  .header { background:var(--card); border-bottom:1px solid var(--border); padding:18px 28px;
+            display:flex; align-items:center; gap:12px; position:sticky; top:0; z-index:2; }
+  .header h1 { margin:0; font-size:20px; }
+  .live { width:10px; height:10px; border-radius:50%; background:var(--green); }
+  .subtle { color:var(--dim); font-size:12px; }
+  .spacer { flex:1; }
+  .back, button { color:var(--blue); background:transparent; border:1px solid var(--border);
+                  border-radius:6px; padding:7px 12px; text-decoration:none; cursor:pointer; }
+  button:hover, .back:hover { border-color:var(--blue); }
+  main { max-width:1400px; margin:0 auto; padding:24px; }
+  .summary { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }
+  .metric { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:10px 14px; }
+  .metric strong { font-size:20px; margin-right:6px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(420px,1fr)); gap:16px; }
+  .card { background:var(--card); border:1px solid var(--border); border-left:4px solid var(--blue);
+          border-radius:10px; padding:18px; }
+  .card.sev-0, .card.sev-1, .card.sev-2 { border-left-color:var(--red); }
+  .card.sev-3 { border-left-color:var(--yellow); }
+  .card.closed { opacity:.65; border-left-color:var(--green); }
+  .top { display:flex; gap:10px; align-items:flex-start; }
+  .title { font-size:16px; font-weight:650; line-height:1.35; flex:1; }
+  .badge { border-radius:999px; padding:3px 9px; font-size:11px; font-weight:700;
+           background:rgba(88,166,255,.13); color:var(--blue); white-space:nowrap; }
+  .badge.severity { background:rgba(227,179,65,.13); color:var(--yellow); }
+  .meta { color:var(--dim); font-size:12px; margin:10px 0; display:flex; gap:12px; flex-wrap:wrap; }
+  .section { margin-top:13px; }
+  .section h3 { color:var(--purple); font-size:11px; text-transform:uppercase;
+                letter-spacing:.5px; margin:0 0 5px; }
+  .section p { margin:0; line-height:1.45; font-size:13px; white-space:pre-wrap; }
+  ul { margin:5px 0 0; padding-left:20px; }
+  li { margin:3px 0; font-size:13px; line-height:1.4; }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:16px; }
+  .resume { color:var(--green); border-color:var(--green); font-weight:650; }
+  .resume:disabled { color:var(--dim); border-color:var(--border); cursor:not-allowed; }
+  .link { display:inline-block; color:var(--blue); text-decoration:none; font-size:12px; margin-right:10px; }
+  .empty { text-align:center; color:var(--dim); padding:80px 20px; }
+  .error { color:var(--red); }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="live"></div>
+  <h1>Investigations</h1>
+  <span class="subtle" id="freshness">Loading…</span>
+  <div class="spacer"></div>
+  <button id="themeToggle" title="Toggle light/dark mode">🌙</button>
+  <a class="back" href="/">← Sessions</a>
+</div>
+<main>
+  <div class="summary" id="summary"></div>
+  <div class="grid" id="grid"><div class="empty">Loading investigations…</div></div>
+</main>
+<script>
+function esc(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function list(items) {
+  if (!Array.isArray(items) || items.length === 0) return '<p class="subtle">Not available yet.</p>';
+  return '<ul>' + items.map(x => '<li>' + esc(typeof x === 'string' ? x : (x.text || x.label || JSON.stringify(x))) + '</li>').join('') + '</ul>';
+}
+function render(data) {
+  const items = Array.isArray(data.items) ? data.items : [];
+  const active = items.filter(x => !['resolved','closed','mitigated'].includes(String(x.state || '').toLowerCase())).length;
+  const investigating = items.filter(x => String(x.investigationStatus || '').toLowerCase() === 'investigating').length;
+  document.getElementById('summary').innerHTML =
+    '<div class="metric"><strong>' + active + '</strong> active</div>' +
+    '<div class="metric"><strong>' + investigating + '</strong> investigating</div>' +
+    '<div class="metric"><strong>' + items.length + '</strong> tracked</div>';
+  document.getElementById('freshness').textContent = data.updatedAt
+    ? 'Updated ' + new Date(data.updatedAt).toLocaleString()
+    : 'Waiting for monitor data';
+  const grid = document.getElementById('grid');
+  if (items.length === 0) {
+    grid.innerHTML = '<div class="empty">No investigations are currently tracked.</div>';
+    return;
+  }
+  grid.innerHTML = items.map(item => {
+    const state = String(item.state || 'Unknown');
+    const closed = ['resolved','closed','mitigated'].includes(state.toLowerCase());
+    const evidence = Array.isArray(item.evidence) ? item.evidence : [];
+    const links = evidence.map(e => e.url
+      ? '<a class="link" href="' + esc(e.url) + '" target="_blank" rel="noreferrer">' + esc(e.label || 'Evidence') + '</a>'
+      : '').join('');
+    const sessionId = item.sessionId || '';
+    return '<article class="card sev-' + esc(item.severity || '') + (closed ? ' closed' : '') + '">' +
+      '<div class="top"><div class="title">#' + esc(item.id) + ' — ' + esc(item.title || 'Untitled investigation') + '</div>' +
+      '<span class="badge severity">Sev ' + esc(item.severity || '?') + '</span>' +
+      '<span class="badge">' + esc(state) + '</span></div>' +
+      '<div class="meta"><span>' + esc(item.environment || '') + '</span><span>' + esc(item.location || '') + '</span>' +
+      '<span>' + esc(item.investigationStatus || 'Queued') + '</span></div>' +
+      '<div class="section"><h3>Current finding</h3><p>' + esc(item.summary || 'Investigation is starting.') + '</p></div>' +
+      '<div class="section"><h3>TSG knowledge</h3><p>' + esc(item.tsg || 'Searching for the relevant troubleshooting guide.') + '</p></div>' +
+      '<div class="section"><h3>Next steps</h3>' + list(item.nextSteps) + '</div>' +
+      (links ? '<div class="section"><h3>Evidence</h3>' + links + '</div>' : '') +
+      '<div class="actions"><button class="resume" data-session-id="' + esc(sessionId) + '" data-title="' +
+      esc('Investigation ' + item.id) + '" data-cwd="' + esc(item.cwd || '') + '"' +
+      (sessionId ? '' : ' disabled') + '>▶ Resume investigation</button>' +
+      (item.agentId ? '<span class="subtle">Agent ' + esc(item.agentId.slice(0, 8)) + '</span>' : '') +
+      '</div></article>';
+  }).join('');
+}
+async function load() {
+  try {
+    const r = await fetch('/api/investigations');
+    render(await r.json());
+  } catch (e) {
+    document.getElementById('grid').innerHTML = '<div class="empty error">Failed to load investigations.</div>';
+  }
+}
+document.addEventListener('click', async e => {
+  const btn = e.target.closest('.resume');
+  if (!btn || btn.disabled) return;
+  const original = btn.textContent;
+  btn.textContent = '⏳ Opening…';
+  try {
+    const r = await fetch('/api/focus-tab', { method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ title:btn.dataset.title, altTitle:btn.dataset.title, cwd:btn.dataset.cwd,
+        sessionId:btn.dataset.sessionId }) });
+    const result = await r.json();
+    btn.textContent = result.action === 'launched' ? '🚀 Launched' : '✅ Focused';
+  } catch { btn.textContent = '❌ Failed'; }
+  setTimeout(() => btn.textContent = original, 2000);
+});
+(function initTheme() {
+  const saved = localStorage.getItem('dashboard-theme') || 'dark';
+  document.documentElement.setAttribute('data-theme', saved);
+  document.getElementById('themeToggle').textContent = saved === 'light' ? '☀️' : '🌙';
+})();
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('dashboard-theme', next);
+  document.getElementById('themeToggle').textContent = next === 'light' ? '☀️' : '🌙';
+});
+load();
+setInterval(load, 10000);
 </script>
 </body>
 </html>`;
@@ -4797,6 +4971,10 @@ const server = createServer((req, res) => {
         sendJson(res, scanRepos());
         return;
     }
+    if (req.url === "/api/investigations") {
+        sendJson(res, loadInvestigations());
+        return;
+    }
     if (req.url === "/api/resume" && req.method === "POST") {
         let body = "";
         req.on("data", chunk => body += chunk);
@@ -5524,6 +5702,11 @@ const server = createServer((req, res) => {
     if (req.url === "/reports") {
         res.writeHead(200, { "Content-Type": "text/html" });
         res.end(cachedHtml("reports", reportsHtml));
+        return;
+    }
+    if (req.url === "/investigations") {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(cachedHtml("investigations", investigationsHtml));
         return;
     }
     res.writeHead(200, { "Content-Type": "text/html" });
