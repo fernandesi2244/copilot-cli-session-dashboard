@@ -72,6 +72,7 @@ Do **not** hard-code `agency copilot` or any internal wrapper — that breaks ex
 - `~/.copilot/session-dashboard-config.json` — optional user config (`userAlias`, `repoScanDirs`)
 - `~/.copilot/saved-workspace.json` — auto-saved workspace state
 - `~/.copilot/activity/reports/` — weekly/monthly report JSON
+- `~/Downloads/active-copilot-session-ids.txt` — active session IDs exported from the main dashboard
 
 ### Event types in `~/.copilot/session-state/<id>/events.jsonl`
 

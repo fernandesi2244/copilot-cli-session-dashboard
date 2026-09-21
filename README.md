@@ -28,6 +28,7 @@ A single-file [GitHub Copilot CLI extension](https://docs.github.com/en/copilot/
 - **Resume** — one click opens a new Windows Terminal tab and resumes a session by id (`--resume`).
 - **Focus** — click to bring an already-running session's terminal tab to the foreground (uses a warm PowerShell process for fast tab switching).
 - **Kill** — terminate a running session from the dashboard.
+- **Export active session IDs** — ⬇️ saves one active session ID per line to `~/Downloads/active-copilot-session-ids.txt`.
 - **Cleanup stale sessions** — 🧹 button finds sessions older than 30 days and lets you delete their state directories.
 
 ### 💾 Workspace Save / Restore
@@ -196,6 +197,7 @@ Extend via either:
 | `~/.copilot/session-dashboard-config.json` | Optional user config |
 | `~/.copilot/saved-workspace.json` | Auto-saved workspace state |
 | `~/.copilot/activity/reports/` | Weekly/monthly report JSON |
+| `~/Downloads/active-copilot-session-ids.txt` | Active session IDs exported from the main dashboard |
 
 ## Platform notes
 

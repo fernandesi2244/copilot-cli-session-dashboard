@@ -20,6 +20,7 @@ const WORKSPACE_FILE = join(homedir(), ".copilot", "saved-workspace.json");
 const TODOS_FILE = join(homedir(), ".copilot", "session-dashboard-todos.json");
 const INVESTIGATIONS_FILE = join(homedir(), ".copilot", "session-dashboard-investigations.json");
 const CONFIG_FILE = join(homedir(), ".copilot", "session-dashboard-config.json");
+const ACTIVE_SESSION_IDS_FILE = join(homedir(), "Downloads", "active-copilot-session-ids.txt");
 
 let _configCache = null;
 let _configCacheTime = 0;
@@ -1747,6 +1748,7 @@ function dashboardHtml() {
   <div class="refresh">Live • auto-refreshing</div>
   <button class="theme-toggle" id="themeToggle" title="Toggle light/dark mode">🌙</button>
   <button class="header-btn" id="soundToggle" title="Toggle sound alerts for attention items">🔔</button>
+  <button class="header-btn" id="exportSessionIdsBtn" title="Save active session IDs to Downloads">⬇️</button>
   <button class="header-btn" id="saveWorkspaceBtn" title="Save all active sessions for later restore">💾</button>
   <button class="header-btn" id="restoreWorkspaceBtn" title="Restore previously saved sessions" style="display:none;">🔄</button>
   <button class="header-btn" id="workspaceBackupsBtn" title="Browse workspace snapshots and promote one to active">📜</button>
@@ -2093,6 +2095,21 @@ document.getElementById('screenBlankBtn').addEventListener('click', async () => 
   try {
     await fetch('/api/screen-blank', { method: 'POST' });
   } catch {}
+});
+
+document.getElementById('exportSessionIdsBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('exportSessionIdsBtn');
+  const orig = btn.textContent;
+  btn.textContent = '⏳';
+  try {
+    const resp = await fetch('/api/export-active-session-ids', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Export failed');
+    showToast('⬇️ Session IDs Saved', data.count + ' active session ID(s) saved to ' + data.fileName + '.', 'success');
+  } catch (error) {
+    showToast('❌ Export Failed', error.message || 'Could not save active session IDs.', 'error');
+  }
+  btn.textContent = orig;
 });
 
 // Lock countdown UI
@@ -4965,6 +4982,20 @@ const server = createServer((req, res) => {
     if (req.url === "/api/sessions") {
         const sessions = scanSessions();
         sendJson(res, sessions);
+        return;
+    }
+    if (req.url === "/api/export-active-session-ids" && req.method === "POST") {
+        try {
+            const sessionIds = scanSessions().filter(session => session.alive).map(session => session.id);
+            writeFileSync(ACTIVE_SESSION_IDS_FILE, sessionIds.length > 0 ? `${sessionIds.join("\n")}\n` : "", "utf-8");
+            sendJson(res, {
+                ok: true,
+                count: sessionIds.length,
+                fileName: basename(ACTIVE_SESSION_IDS_FILE),
+            });
+        } catch (error) {
+            sendJson(res, { error: String(error) }, 500);
+        }
         return;
     }
     if (req.url === "/api/repos") {
