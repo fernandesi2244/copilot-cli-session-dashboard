@@ -1,6 +1,6 @@
 # Copilot CLI Session Dashboard
 
-A single-file [GitHub Copilot CLI extension](https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli) that runs a local web dashboard for monitoring and managing all your concurrent Copilot CLI sessions.
+A [GitHub Copilot CLI extension](https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli) that runs a local web dashboard for monitoring and managing all your concurrent Copilot CLI sessions.
 
 > ⚠️ **Note:** This is a personal project I built before the official GitHub Copilot desktop app shipped its own session management UI. It is **not** intended to replicate or compete with the Copilot app — it just solves some different problems I had around multi-session workflows, workspace persistence, and AI-organized todos. Sharing in case any of it is useful to others.
 
@@ -33,12 +33,18 @@ A single-file [GitHub Copilot CLI extension](https://docs.github.com/en/copilot/
 
 ### 💾 Workspace Save / Restore
 
-- **Auto-save** — the extension snapshots all active sessions to `saved-workspace.json` every 60 seconds.
-- **Startup guard** — refuses to shrink the saved set during the first 3 minutes after startup (prevents a fresh terminal with 0 visible sessions from clobbering a good save).
-- **Rolling backups** — keeps 10 numbered backup snapshots (`.1` = newest, `.10` = oldest), rotated only when the session list actually changes.
-- **Manual save** (💾 button) — force a snapshot of the current session set.
-- **Restore** (🔄 button) — re-open all saved sessions in new Windows Terminal tabs. Deduplicates against already-running sessions.
-- **📜 Snapshot browser** — browse all backup snapshots in a modal, inspect which sessions each contains, and **promote** any backup to the active save file (safely rotating the current one into the backup chain first).
+- **Durable recovery roster** — SDK registrations and positive process observations are merged into a local SQLite database. Empty or partial scans never remove sessions, even long after startup. Closing a tab is not treated as an intentional removal; use **Forget selected** on `/recovery` when finished.
+- **Coordinated persistence** — all extension instances register heartbeats, but a database lease gives one coordinator responsibility for process discovery, JSON projections, and restores. Transactions serialize roster changes; the journal records opens, membership changes, and restore outcomes.
+- **Previous-boot checkpoints** — detecting an OS boot change preserves the previous roster independently of rolling backups. Initial migration also preserves an immutable baseline from the union of existing snapshots.
+- **Rolling backups** — `saved-workspace.json` is a compatibility projection, not the source of truth. Ten numbered backups rotate on membership changes, not ordering changes.
+- **Manual save** (💾 button) — merge currently detected sessions without discarding closed or temporarily undiscovered sessions.
+- **Verified restore** (🔄 button) — launch at most two sessions concurrently, deduplicate across extension instances, and report queued/launching/failed/unconfirmed separately. A session is marked **resumed** only after both a fresh `session.resume` event and positive liveness evidence. The confirmation timeout is three minutes; retries are never automatic.
+- **Recovery page** (`/recovery`) — choose sessions, copy resumable IDs, inspect failures, add previous-boot checkpoints, or search actual resume events for a local calendar date. Date searches stream conversation histories and handle daylight-saving transitions; last-message timestamps are not used as resume dates.
+- **📜 Snapshot browser** — inspect rolling backups and add their sessions to recovery without replacing other entries or launching anything.
+
+Liveness combines SDK heartbeats with PID creation times, CLI resume arguments, and validated legacy lock files. Stale or unavailable process discovery is shown as **unknown**, not silently treated as a closed session; new launches pause rather than risk duplicates. Missing conversation history or original working directories produce explicit errors instead of falling back to the home directory.
+
+Restart existing CLI hosts after updating so they use the new coordinator and recovery UI. Older extension processes may still overwrite legacy JSON snapshots, but cannot shrink the canonical SQLite roster. Restore is always user-initiated; loading the extension does not reopen tabs automatically.
 
 ### 📝 AI-Organized Todos (with worktree launcher)
 
@@ -80,11 +86,12 @@ A dropdown in the header bar lets you quickly open any discovered repo in VS Cod
 
 ## Installation
 
-The extension is a single `extension.mjs` file with no build step or `npm install`.
+The extension uses `extension.mjs` and `session-recovery.mjs`, with no build step or `npm install`. Keep both files together (cloning the repository does this).
 
 ### Prerequisites
 
 - **GitHub Copilot CLI** installed and signed in (this is what loads the extension)
+- **Node.js 24+ runtime** with built-in `node:sqlite` support (provided by current Copilot CLI extension hosts; also required for local development)
 - **Git** on `PATH` (used for repo discovery and worktree creation)
 - **[GitHub CLI (`gh`)](https://cli.github.com/)** signed in (`gh auth login`) — used by the todos page to call the Copilot LLM for parsing your brain-dump
 - **Windows Terminal (`wt`)** on `PATH` — required for any feature that opens a new terminal tab (Resume, Restore Workspace, Todos 🚀 launcher). Comes built-in on Windows 11; install from the Microsoft Store on Windows 10.
@@ -154,7 +161,7 @@ Every branch the todos launcher creates is prefixed with your alias. Resolution 
 
 ### Copilot CLI command (for non-standard installs)
 
-The dashboard launches new terminal tabs with `copilot --resume=<id>`. If your Copilot CLI is invoked via a wrapper (e.g. `agency copilot` on internal Microsoft builds), override the command:
+The dashboard launches new terminal tabs with `copilot --resume=<id>`. If your Copilot CLI is invoked via a wrapper, override the command:
 
 1. `COPILOT_DASHBOARD_CLI_COMMAND` env var, **or**
 2. `copilotCommand` in `~/.copilot/session-dashboard-config.json`
@@ -195,7 +202,9 @@ Extend via either:
 | `~/.copilot/session-dashboard-notes.json` | Per-session notes |
 | `~/.copilot/session-dashboard-todos.json` | Todos data |
 | `~/.copilot/session-dashboard-config.json` | Optional user config |
-| `~/.copilot/saved-workspace.json` | Auto-saved workspace state |
+| `~/.copilot/session-recovery.db` (plus SQLite WAL/SHM files) | Canonical recovery roster, observers, restore attempts, journal, and boot checkpoints |
+| `~/.copilot/saved-workspace.json` and `.1` … `.10` | Compatibility projection and rolling snapshots |
+| `~/.copilot/workspace-checkpoints/` | Immutable JSON exports of boot checkpoints and migration baseline |
 | `~/.copilot/activity/reports/` | Weekly/monthly report JSON |
 | `~/Downloads/active-copilot-session-ids.txt` | Active session IDs exported from the main dashboard |
 
@@ -208,6 +217,8 @@ Extend via either:
 ## Development
 
 The dashboard does **not** hot-reload. After editing `extension.mjs` you must restart your Copilot CLI host process. The chosen port also changes on every restart, so re-read `~/.copilot/session-dashboard-port` after restarting.
+
+Run `npm test` for isolated recovery and HTTP integration tests (the SDK, user home, shell, and terminal are stubbed; no real sessions are launched). Run `node --check extension.mjs` for the extension syntax check.
 
 See [`AGENTS.md`](./AGENTS.md) for instructions to AI assistants contributing to this code.
 

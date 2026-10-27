@@ -9,6 +9,10 @@ import { exec, spawn, execSync } from "node:child_process";
 import { readdirSync, readFileSync, existsSync, statSync, writeFileSync, renameSync, mkdirSync, unlinkSync, rmSync, openSync, readSync, closeSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
+import {
+    RecoveryStore, findSessionsResumed, launchSessionTab, readRuntimeProcesses,
+    sessionPresence, shareRuntime, validateSessionId,
+} from "./session-recovery.mjs";
 
 const SESSION_STATE_DIR = join(homedir(), ".copilot", "session-state");
 const POLL_INTERVAL_MS = 3000;
@@ -62,8 +66,7 @@ const USER_ALIAS = resolveUserAlias();
 
 function resolveCopilotCommand() {
     // Priority: env var → config file → default "copilot".
-    // Override this if you launch the Copilot CLI via a wrapper script (e.g.
-    // "agency copilot" on an internal Microsoft build).
+    // Override this if you launch the Copilot CLI via a wrapper script.
     const fromEnv = process.env.COPILOT_DASHBOARD_CLI_COMMAND;
     if (fromEnv && fromEnv.trim()) return fromEnv.trim();
     const cfg = loadDashboardConfig();
@@ -73,10 +76,77 @@ function resolveCopilotCommand() {
     return "copilot";
 }
 const COPILOT_CMD = resolveCopilotCommand();
-const AUTO_SAVE_INTERVAL_MS = 60 * 1000; // 1 minute
-const WORKSPACE_STARTUP_TIME = Date.now();
-const WORKSPACE_STARTUP_GRACE_MS = 3 * 60 * 1000; // 3 min: refuse to shrink saved set during this window
 const WORKSPACE_BACKUP_COUNT = 10; // keep N rolling snapshots (.1 = newest)
+let runtimeSnapshot = { healthy: false, processes: [], capturedAt: 0 };
+try { runtimeSnapshot = await readRuntimeProcesses(); }
+catch (error) { console.warn("Session process discovery:", error.message); }
+const recovery = new RecoveryStore({ directory: join(homedir(), ".copilot"), bootId: runtimeSnapshot.bootId });
+const observerStartedAt = Math.round(Date.now() - process.uptime() * 1000);
+let runtimeRefresh = null;
+let recoveryTickRunning = false;
+let registeredSessionId = null;
+const discoveredRecoveries = new Map();
+
+async function refreshRuntime() {
+    const shared = recovery.meta("runtime");
+    if (shared) {
+        const snapshot = JSON.parse(shared);
+        if (Date.now() - snapshot.capturedAt < 10000) runtimeSnapshot = snapshot;
+    }
+    if (runtimeSnapshot.healthy && Date.now() - runtimeSnapshot.capturedAt < 5000) return runtimeSnapshot;
+    if (runtimeRefresh) return runtimeRefresh;
+    runtimeRefresh = readRuntimeProcesses().then(snapshot => {
+        runtimeSnapshot = snapshot;
+        recovery.setBoot(snapshot.bootId);
+        if (mainSession && registeredSessionId !== mainSession.sessionId) registerRecoverySession();
+        // Share identity evidence, never arbitrary process arguments.
+        recovery.setMeta("runtime", JSON.stringify(shareRuntime(snapshot)));
+        return runtimeSnapshot;
+    }).catch(error => {
+        runtimeSnapshot = { ...runtimeSnapshot, healthy: false };
+        console.warn("Session process discovery:", error.message);
+        return runtimeSnapshot;
+    }).finally(() => { runtimeRefresh = null; });
+    return runtimeRefresh;
+}
+
+function recoveryMetadata(id) {
+    validateSessionId(id);
+    let meta = {};
+    try { meta = parseYaml(readFileSync(join(SESSION_STATE_DIR, id, "workspace.yaml"), "utf8")); } catch {}
+    const discovered = discoveredRecoveries.get(id) || {};
+    return { sessionId: id, cwd: meta.cwd || discovered.cwd || "", summary: meta.summary || discovered.summary || "", branch: meta.branch || "", repository: meta.repository || "" };
+}
+
+async function recoveryTick() {
+    try { recovery.heartbeat(); }
+    catch (error) { console.warn("Session heartbeat:", error.message); return; }
+    if (recoveryTickRunning) return;
+    recoveryTickRunning = true;
+    try {
+        if (!recovery.claimCoordinator()) {
+            const shared = recovery.meta("runtime");
+            if (shared) runtimeSnapshot = JSON.parse(shared);
+            return;
+        }
+        await refreshRuntime();
+        invalidateSessionCache();
+        recovery.observe(scanSessions().filter(s => s.alive).map(s => ({ ...s, summary: s.baseSummary || s.summary })));
+        recovery.projectWorkspace();
+        await recovery.tickRestores(runtimeSnapshot, session => launchSessionTab(session, COPILOT_CMD));
+    } catch (error) { console.warn("Session recovery:", error.message); }
+    finally { recoveryTickRunning = false; }
+}
+
+async function queueRecovery(ids) {
+    if (!Array.isArray(ids) || !ids.length) throw new Error("Select at least one session");
+    const unique = [...new Set(ids.map(validateSessionId))];
+    recovery.include(unique.map(recoveryMetadata));
+    await refreshRuntime();
+    const results = recovery.queue(unique, runtimeSnapshot);
+    void recoveryTick();
+    return results;
+}
 let lockTimer = null; // countdown timer for lock-after-dismiss
 let screenBlankActive = false; // guard against double-spawning
 let lockFlowActive = false; // guard against duplicate screen-dismissed calls
@@ -970,24 +1040,9 @@ function _scanSessionsUncached() {
         const cwdVal = meta.cwd || "";
         if (EXCLUDED_CWD_PATTERNS.some(p => p.test(cwdVal))) continue;
 
-        // Check lock files — session is alive if ANY lock PID is alive
-        let lockPid = null;
-        let isAlive = false;
-        try {
-            const files = readdirSync(dir);
-            const locks = files.filter(f => f.startsWith("inuse.") && f.endsWith(".lock"));
-            for (const lock of locks) {
-                const pid = lock.replace("inuse.", "").replace(".lock", "");
-                if (isProcessAlive(pid)) {
-                    lockPid = pid;
-                    isAlive = true;
-                    break;
-                }
-            }
-            if (!lockPid && locks.length > 0) {
-                lockPid = locks[0].replace("inuse.", "").replace(".lock", "");
-            }
-        } catch {}
+        const presence = sessionPresence(recovery, name, runtimeSnapshot);
+        const lockPid = presence.pid;
+        const isAlive = presence.alive;
 
         // Read only a bounded tail and cache compact derived data.
         let eventTail = "";
@@ -1008,7 +1063,11 @@ function _scanSessionsUncached() {
             }
         }
 
-        const statusInfo = deriveStatus(lastEvents, lockPid, isAlive);
+        const statusInfo = presence.liveness === "unknown"
+            ? { status: "unknown", label: "Unknown", icon: "❔" }
+            : presence.liveness === "starting"
+                ? { status: "starting", label: "Starting", icon: "⏳" }
+                : deriveStatus(lastEvents, lockPid, isAlive);
 
         // Get last meaningful event time
         let lastActivity = meta.updated_at || meta.created_at || "";
@@ -1050,6 +1109,8 @@ function _scanSessionsUncached() {
             updatedAt: lastActivity,
             pid: lockPid,
             alive: isAlive,
+            liveness: presence.liveness,
+            processStartedAt: presence.processStartedAt || null,
             ...statusInfo,
             ...progressInfo,
         });
@@ -1751,7 +1812,8 @@ function dashboardHtml() {
   <button class="header-btn" id="exportSessionIdsBtn" title="Save active session IDs to Downloads">⬇️</button>
   <button class="header-btn" id="saveWorkspaceBtn" title="Save all active sessions for later restore">💾</button>
   <button class="header-btn" id="restoreWorkspaceBtn" title="Restore previously saved sessions" style="display:none;">🔄</button>
-  <button class="header-btn" id="workspaceBackupsBtn" title="Browse workspace snapshots and promote one to active">📜</button>
+  <button class="header-btn" id="workspaceBackupsBtn" title="Browse snapshots and add their sessions to recovery">📜</button>
+  <a href="/recovery" class="header-btn" title="Recover sessions by date or previous boot" style="text-decoration:none;">Recovery</a>
   <button class="header-btn" id="screenBlankBtn" title="Blank all screens (click/key/mouse to dismiss)">&#x1f5a5;&#xfe0f;</button>
   <button class="header-btn" id="cancelLockBtn" title="Cancel computer lock" style="display:none;background:#b62324;color:#fff;border-color:#b62324;font-weight:700;min-width:90px;">🔓 3s</button>
   <button class="header-btn" id="cleanupBtn" title="Clean up stale sessions">🧹</button>
@@ -2056,8 +2118,10 @@ async function resumeSession(btn) {
     const resp = await fetch('/api/focus-tab', { method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ title, altTitle, pid, cwd, sessionId: sid }) });
     const data = await resp.json();
-    if (data.action === 'launched') {
-      btn.textContent = '🚀 Launched';
+    if (!resp.ok || data.ok === false) throw new Error(data.error || data.results?.[0]?.error || 'Resume failed');
+    if (data.results) {
+      showRestoreProgress(data.results);
+      btn.textContent = data.action === 'already-running' ? 'Already running' : 'Queued';
     } else {
       btn.textContent = '✅ Focused';
     }
@@ -2205,14 +2269,42 @@ document.getElementById('saveWorkspaceBtn').addEventListener('click', async () =
     const resp = await fetch('/api/save-workspace', { method: 'POST' });
     const data = await resp.json();
     if (data.count > 0) {
-      showToast('💾 Workspace Saved', data.count + ' active session(s) saved. Restore after restart with 🔄.', 'success');
+      showToast('💾 Workspace Saved', data.count + ' sessions retained for recovery, including currently closed sessions.', 'success');
     } else {
-      showToast('💾 No Sessions', 'No active sessions to save.', '');
+      showToast('💾 No Sessions', 'No tracked sessions to save.', '');
     }
     checkWorkspaceStatus();
   } catch { showToast('❌ Save Failed', 'Could not save workspace.', 'error'); }
   btn.textContent = orig;
 });
+
+async function showRestoreProgress(results) {
+  const pending = results.filter(r => r.state === 'queued' || r.state === 'launching').map(r => r.id);
+  const describe = rows => {
+    const counts = {};
+    for (const row of rows) counts[row.state] = (counts[row.state] || 0) + 1;
+    return Object.entries(counts).map(([state, count]) => count + ' ' + state).join(', ');
+  };
+  showToast('Restore status', escapeHtml(describe(results)) + '. <a href="/recovery">Details</a>', '');
+  if (!pending.length) return;
+  const final = new Map(results.map(r => [r.id, r]));
+  const deadline = Date.now() + Math.ceil(pending.length / 2) * 195000 + 60000;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    try {
+      const resp = await fetch('/api/restore-status?ids=' + pending.join(','));
+      if (!resp.ok) throw new Error('Status unavailable');
+      const data = await resp.json();
+      for (const row of data.results) final.set(row.id, row);
+      if ([...final.values()].some(r => r.state === 'queued' || r.state === 'launching')) continue;
+      const rows = [...final.values()];
+      showToast('Restore finished', escapeHtml(describe(rows)) + '. <a href="/recovery">Details</a>',
+        rows.some(r => r.state === 'failed' || r.state === 'unconfirmed' || r.state === 'interrupted') ? 'error' : 'success');
+      return;
+    } catch { break; }
+  }
+  showToast('Restore not confirmed', 'See <a href="/recovery">Recovery</a> for current progress. No automatic retry.', 'error');
+}
 
 document.getElementById('restoreWorkspaceBtn').addEventListener('click', async () => {
   const btn = document.getElementById('restoreWorkspaceBtn');
@@ -2220,19 +2312,15 @@ document.getElementById('restoreWorkspaceBtn').addEventListener('click', async (
   try {
     const st = await fetch('/api/workspace-status').then(r => r.json());
     if (!st.hasSaved || st.count === 0) { showToast('No Saved Workspace', '', ''); return; }
-    if (!confirm('Restore ' + st.count + ' session(s) saved ' + timeAgo(st.savedAt) + '?')) return;
+    if (!confirm('Restore all ' + st.count + ' tracked sessions? Closed sessions remain tracked until explicitly forgotten. Use Recovery to choose a subset.')) return;
   } catch { return; }
   const orig = btn.textContent;
   btn.textContent = '⏳';
   try {
     const resp = await fetch('/api/restore-workspace', { method: 'POST' });
     const data = await resp.json();
-    let msg = '';
-    if (data.restored > 0) msg += data.restored + ' restored. ';
-    if (data.skippedAlive > 0) msg += data.skippedAlive + ' already running. ';
-    if (data.skippedMissing > 0) msg += data.skippedMissing + ' missing. ';
-    if (data.failed > 0) msg += data.failed + ' failed. ';
-    showToast('🔄 Workspace Restored', msg.trim(), data.restored > 0 ? 'success' : 'error');
+    if (!resp.ok) throw new Error(data.error || 'Restore failed');
+    void showRestoreProgress(data.results || []);
     checkWorkspaceStatus();
   } catch { showToast('❌ Restore Failed', '', 'error'); }
   btn.textContent = orig;
@@ -2271,7 +2359,7 @@ async function openWorkspaceBackups() {
       }).join('');
       const promoteBtn = isCurrent
         ? ''
-        : '<button class="ws-backup-btn primary" data-slot="' + snap.slot + '" data-action="promote">⬆️ Make active</button>';
+        : '<button class="ws-backup-btn primary" data-slot="' + snap.slot + '" data-action="promote">Add to recovery</button>';
       return '<div class="ws-backup-row ' + (isCurrent ? 'active' : '') + '" data-idx="' + idx + '">' +
         '<div class="ws-backup-head">' +
           '<div class="ws-backup-meta">' +
@@ -2298,9 +2386,9 @@ async function openWorkspaceBackups() {
     body.querySelectorAll('button[data-action="promote"]').forEach(b => {
       b.addEventListener('click', async () => {
         const slot = b.dataset.slot;
-        if (!confirm('Promote backup .' + slot + ' to the active saved workspace?\\n\\nThe current active file will be rotated into the backup chain (becoming .1).')) return;
+        if (!confirm('Add sessions from backup .' + slot + ' to recovery? Existing recovery entries will be retained. No sessions will be launched.')) return;
         b.disabled = true;
-        b.textContent = '⏳ Promoting…';
+        b.textContent = 'Adding...';
         try {
           const resp = await fetch('/api/workspace-promote', {
             method: 'POST',
@@ -2309,18 +2397,18 @@ async function openWorkspaceBackups() {
           });
           const data = await resp.json();
           if (data.ok) {
-            showToast('⬆️ Snapshot Promoted', 'Backup .' + slot + ' is now active (' + data.count + ' sessions). Click 🔄 to restore.', 'success');
+            showToast('Snapshot Added', data.count + ' sessions added to recovery. <a href="/recovery">Choose sessions to restore</a>.', 'success');
             checkWorkspaceStatus();
             openWorkspaceBackups(); // refresh list
           } else {
             showToast('❌ Promote Failed', data.error || '', 'error');
             b.disabled = false;
-            b.textContent = '⬆️ Make active';
+            b.textContent = 'Add to recovery';
           }
         } catch (e) {
           showToast('❌ Promote Failed', String(e), 'error');
           b.disabled = false;
-          b.textContent = '⬆️ Make active';
+          b.textContent = 'Add to recovery';
         }
       });
     });
@@ -4376,83 +4464,9 @@ load();
 </body></html>`;
 }
 
-// --- Auto-save workspace helper ---
-//
-// Safety design (see AGENTS.md / 2026-05-18 update):
-//  1. Refuse to shrink the saved session set during the startup grace window.
-//     This prevents a fresh terminal (which may briefly see 0 or 1 sessions
-//     before discovery completes) from clobbering a healthy saved state.
-//  2. Keep rolling numbered backups (saved-workspace.json.1 .. .N) so a bad
-//     save can be recovered by copying the appropriate backup over the
-//     primary file. Rotation only runs when the session list actually
-//     changes, to avoid churning identical snapshots.
-function rotateWorkspaceBackups() {
-    try {
-        if (!existsSync(WORKSPACE_FILE)) return;
-        const oldest = `${WORKSPACE_FILE}.${WORKSPACE_BACKUP_COUNT}`;
-        if (existsSync(oldest)) { try { unlinkSync(oldest); } catch {} }
-        for (let i = WORKSPACE_BACKUP_COUNT - 1; i >= 1; i--) {
-            const src = `${WORKSPACE_FILE}.${i}`;
-            const dst = `${WORKSPACE_FILE}.${i + 1}`;
-            if (existsSync(src)) { try { renameSync(src, dst); } catch {} }
-        }
-        try {
-            renameSync(WORKSPACE_FILE, `${WORKSPACE_FILE}.1`);
-        } catch {
-            try { writeFileSync(`${WORKSPACE_FILE}.1`, readFileSync(WORKSPACE_FILE)); } catch {}
-        }
-    } catch {}
-}
-
 function autoSaveWorkspace() {
-    try {
-        const sessions = scanSessions();
-        const alive = sessions.filter(s => s.alive);
-        if (alive.length === 0) return; // never persist an empty state
-
-        // Read previous saved state to compare against.
-        let prevSessions = null;
-        let prevContent = null;
-        if (existsSync(WORKSPACE_FILE)) {
-            try {
-                prevContent = readFileSync(WORKSPACE_FILE, "utf-8");
-                const prev = JSON.parse(prevContent);
-                if (Array.isArray(prev.sessions)) prevSessions = prev.sessions;
-            } catch {}
-        }
-        const prevCount = prevSessions ? prevSessions.length : 0;
-
-        // Guard #1: during the startup grace window, refuse to shrink the
-        // saved set. A new terminal opening shouldn't be able to delete
-        // previously-tracked sessions just because it can't see them yet.
-        const sinceStart = Date.now() - WORKSPACE_STARTUP_TIME;
-        if (sinceStart < WORKSPACE_STARTUP_GRACE_MS && prevCount > 0 && alive.length < prevCount) {
-            return;
-        }
-
-        const saved = alive.map(s => ({
-            sessionId: s.id,
-            cwd: s.cwd || "",
-            summary: s.summary || "",
-            branch: s.branch || "",
-            repository: s.repository || "",
-        }));
-        const payload = { version: 1, savedAt: new Date().toISOString(), sessions: saved };
-        const newJson = JSON.stringify(payload, null, 2);
-
-        // Guard #3: only rotate backups when the session list actually
-        // changes; otherwise we'd churn 10 identical snapshots per 10 minutes.
-        let sameSessions = false;
-        if (prevSessions && prevSessions.length === saved.length) {
-            // Quick comparison: check if session IDs are identical (ordered)
-            sameSessions = prevSessions.every((ps, i) => ps.sessionId === saved[i]?.sessionId);
-        }
-        if (!sameSessions) rotateWorkspaceBackups();
-
-        const tmpFile = WORKSPACE_FILE + ".tmp";
-        writeFileSync(tmpFile, newJson);
-        renameSync(tmpFile, WORKSPACE_FILE);
-    } catch {}
+    recovery.observe(scanSessions().filter(s => s.alive).map(s => ({ ...s, summary: s.baseSummary || s.summary })));
+    recovery.projectWorkspace();
 }
 
 // --- Reports HTML page ---
@@ -4966,8 +4980,202 @@ loadReports();
 </html>`;
 }
 
+function recoveryHtml() {
+    return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Session Recovery</title>
+<style>
+:root { color-scheme:dark; --bg:#0d1117; --panel:#161b22; --fg:#e6edf3; --muted:#8b949e; --border:#30363d; --link:#58a6ff; }
+[data-theme="light"] { color-scheme:light; --bg:#fff; --panel:#f6f8fa; --fg:#1f2328; --muted:#59636e; --border:#d1d9e0; --link:#0969da; }
+body { margin:24px; background:var(--bg); color:var(--fg); font:14px system-ui,sans-serif; }
+header,.toolbar { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:16px; }
+h1 { margin:0; font-size:24px; } a { color:var(--link); }
+button,input,select { color:var(--fg); background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:8px; }
+button { cursor:pointer; } button:disabled { opacity:.5; cursor:wait; }
+p,.hint,small { color:var(--muted); } #status { min-height:24px; } #warning { color:#d29922; }
+.table-wrap { overflow:auto; } table { width:100%; border-collapse:collapse; text-align:left; }
+th,td { padding:12px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+code { user-select:all; } .error { color:#f85149; } td:first-child { width:30px; }
+td small { display:block; overflow-wrap:anywhere; } :focus-visible { outline:2px solid var(--link); outline-offset:2px; }
+</style></head><body>
+<header><a href="/">Back to monitor</a><h1>Session Recovery</h1><button id="theme" aria-label="Toggle light/dark theme">Theme</button></header>
+<p>Sessions stay in recovery until explicitly forgotten. Closing a tab, a partial scan, or a reboot never removes them.
+Restores open at most two sessions at a time; "resumed" requires a new resume event and a running session.</p>
+<div class="toolbar">
+<label for="day">Resumed on (local date)</label><input id="day" type="date">
+<button id="find">Search history</button><button id="roster">Show recovery roster</button>
+<span class="hint" id="timezone"></span>
+</div>
+<div class="toolbar">
+<label for="checkpoint">Previous-boot checkpoint</label><select id="checkpoint"><option value="">None yet</option></select>
+<button id="addCheckpoint">Add checkpoint to recovery</button>
+</div>
+<div class="toolbar"><button id="restore">Restore selected</button><button id="copy">Copy selected IDs</button><button id="forget">Forget selected</button></div>
+<p>History search streams actual <code>session.resume</code> events, not last-message dates. Forgetting removes only recovery membership, not conversation files.</p>
+<div id="warning" role="status"></div><div id="status" role="status" aria-live="polite"></div>
+<div class="table-wrap"><table><thead><tr>
+<th><input id="all" type="checkbox" aria-label="Select all displayed sessions"></th>
+<th>Session / resumable ID</th><th>Working directory</th><th>Last opened / resume evidence</th><th>Presence / restore</th>
+</tr></thead><tbody id="rows"></tbody></table></div>
+<script>
+document.documentElement.dataset.theme = localStorage.getItem('dashboard-theme') || 'dark';
+const el = id => document.getElementById(id);
+const escape = value => String(value || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const selected = () => [...document.querySelectorAll('#rows input:checked')].map(input => input.dataset.id);
+let searchResults = null;
+let loading = false;
+let searching = false;
+function localDayRange(value) {
+  const [year, month, day] = value.split('-').map(Number);
+  const start = new Date(year, month - 1, day);
+  const end = new Date(year, month - 1, day + 1);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+const yesterday = new Date();
+yesterday.setDate(yesterday.getDate() - 1);
+el('day').value = yesterday.getFullYear() + '-' + String(yesterday.getMonth() + 1).padStart(2, '0') + '-' + String(yesterday.getDate()).padStart(2, '0');
+el('timezone').textContent = Intl.DateTimeFormat().resolvedOptions().timeZone;
+async function api(url, data) {
+  const response = await fetch(url, data === undefined ? {} : { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data) });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || 'Request failed');
+  return result;
+}
+async function refresh() {
+  if (loading) return;
+  loading = true;
+  try {
+    const data = await api('/api/recovery');
+    const checked = new Set(selected());
+    const byId = new Map(data.sessions.map(s => [s.sessionId, s]));
+    const sessions = searchResults === null ? data.sessions : searchResults.map(s => ({ ...s, ...(byId.get(s.sessionId) || {}) }));
+    el('warning').textContent = data.discoveryHealthy ? '' : 'Process discovery is unavailable or stale. Presence is unknown; new launches are paused to avoid duplicates.';
+    el('rows').innerHTML = sessions.map(s => '<tr><td><input type="checkbox" aria-label="Select session ' + escape(s.sessionId) + '" data-id="' + escape(s.sessionId) + '"' + (checked.has(s.sessionId) ? ' checked' : '') + '></td>' +
+      '<td>' + escape(s.summary || 'Untitled') + '<small><code>' + escape(s.sessionId) + '</code></small></td>' +
+      '<td>' + escape(s.cwd || '(missing)') + '</td>' +
+      '<td>' + escape((s.lastResumedAt || s.lastOpenedAt) ? new Date(s.lastResumedAt || s.lastOpenedAt).toLocaleString() : 'Not recorded') +
+      (s.evidenceLine ? '<small>events.jsonl line ' + s.evidenceLine + ' (' + s.count + ' resume events)</small>' : '') + '</td>' +
+      '<td>' + escape(s.liveness || 'not checked') + ' / ' + escape(s.state || 'not tracked') +
+      (s.error ? '<small class="error">' + escape(s.error) + '</small>' : '') + '</td></tr>').join('') || '<tr><td colspan="5">No sessions found.</td></tr>';
+    const checkpoint = el('checkpoint').value;
+    el('checkpoint').innerHTML = data.checkpoints.map(c => '<option value="' + escape(c.bootId) + '">' +
+      (c.bootId === 'legacy-import' ? 'Imported workspace' : escape(new Date(c.savedAt).toLocaleString())) + ' - ' + c.count + ' sessions</option>').join('') || '<option value="">None yet</option>';
+    if (data.checkpoints.some(c => c.bootId === checkpoint)) el('checkpoint').value = checkpoint;
+  } catch (error) { el('status').textContent = error.message; }
+  finally { loading = false; }
+}
+el('all').addEventListener('change', () => document.querySelectorAll('#rows input').forEach(input => { input.checked = el('all').checked; }));
+el('theme').addEventListener('click', () => {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next; localStorage.setItem('dashboard-theme', next);
+});
+el('roster').addEventListener('click', () => { searchResults = null; void refresh(); });
+el('find').addEventListener('click', async () => {
+  if (!el('day').value) { el('status').textContent = 'Choose a date.'; return; }
+  if (searching) return;
+  searching = true; el('find').disabled = true; el('status').textContent = 'Searching resume events...';
+  try {
+    const range = localDayRange(el('day').value);
+    const result = await api('/api/recovery/find?' + new URLSearchParams(range));
+    searchResults = result.sessions;
+    el('status').textContent = result.sessions.length + ' sessions resumed on this local date.';
+    await refresh();
+  } catch (error) { el('status').textContent = error.message; }
+  finally { searching = false; el('find').disabled = false; }
+});
+el('restore').addEventListener('click', async () => {
+  const sessionIds = selected();
+  if (!sessionIds.length) { el('status').textContent = 'Select sessions to restore.'; return; }
+  if (!confirm('Restore ' + sessionIds.length + ' selected sessions? Already-running sessions will be skipped.')) return;
+  el('restore').disabled = true;
+  try {
+    const data = await api('/api/recovery/restore', { sessionIds });
+    el('status').textContent = data.results.map(r => r.id.slice(0, 8) + ': ' + r.state + (r.error ? ' - ' + r.error : '')).join('; ');
+    await refresh();
+  } catch (error) { el('status').textContent = error.message; }
+  finally { el('restore').disabled = false; }
+});
+el('forget').addEventListener('click', async () => {
+  const sessionIds = selected();
+  if (!sessionIds.length || !confirm('Forget ' + sessionIds.length + ' sessions from recovery? Conversation files and previous-boot checkpoints are kept.')) return;
+  try { await api('/api/recovery/forget', { sessionIds }); el('status').textContent = 'Removed from recovery. History is unchanged.'; await refresh(); }
+  catch (error) { el('status').textContent = error.message; }
+});
+el('copy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(selected().join('\\n')); el('status').textContent = 'Selected IDs copied.'; }
+  catch (error) { el('status').textContent = error.message; }
+});
+el('addCheckpoint').addEventListener('click', async () => {
+  const bootId = el('checkpoint').value;
+  if (!bootId || !confirm('Add this checkpoint to recovery without removing existing entries? This does not launch sessions.')) return;
+  try { await api('/api/recovery/checkpoint', { bootId }); searchResults = null; el('status').textContent = 'Checkpoint added. Select sessions to restore.'; await refresh(); }
+  catch (error) { el('status').textContent = error.message; }
+});
+void refresh();
+setInterval(() => { void refresh(); }, 2000);
+</script></body></html>`;
+}
+
 // --- HTTP Server ---
-const server = createServer((req, res) => {
+async function requestJson(req) {
+    let body = "";
+    for await (const chunk of req) {
+        body += chunk;
+        if (body.length > 1024 * 1024) throw new Error("Request is too large");
+    }
+    return JSON.parse(body || "{}");
+}
+
+const server = createServer(async (req, res) => {
+    const requestUrl = new URL(req.url, "http://localhost");
+    if (requestUrl.pathname === "/recovery") {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(cachedHtml("recovery", recoveryHtml));
+        return;
+    }
+    if (requestUrl.pathname.startsWith("/api/recovery")) {
+        try {
+            if (requestUrl.pathname === "/api/recovery" && req.method === "GET") {
+                sendJson(res, {
+                    sessions: recovery.list().map(row => ({
+                        ...row.metadata, state: row.state, error: row.error,
+                        lastOpenedAt: row.last_opened_at ? new Date(row.last_opened_at).toISOString() : null,
+                        ...sessionPresence(recovery, row.id, runtimeSnapshot),
+                    })),
+                    discoveryHealthy: runtimeSnapshot.healthy && Date.now() - runtimeSnapshot.capturedAt < 25000,
+                    checkpoints: recovery.checkpoints().map(c => ({ bootId: c.bootId, savedAt: c.savedAt, count: c.data.sessions.length })),
+                });
+            } else if (requestUrl.pathname === "/api/recovery/find" && req.method === "GET") {
+                const results = await findSessionsResumed(SESSION_STATE_DIR, {
+                    start: requestUrl.searchParams.get("start"), end: requestUrl.searchParams.get("end"),
+                }, recoveryMetadata);
+                for (const result of results) discoveredRecoveries.set(result.sessionId, result);
+                sendJson(res, { sessions: results });
+            } else if (requestUrl.pathname === "/api/recovery/restore" && req.method === "POST") {
+                const { sessionIds } = await requestJson(req);
+                sendJson(res, { results: await queueRecovery(sessionIds) }, 202);
+            } else if (requestUrl.pathname === "/api/recovery/forget" && req.method === "POST") {
+                const { sessionIds } = await requestJson(req);
+                if (!Array.isArray(sessionIds) || !sessionIds.length) throw new Error("Select at least one session");
+                recovery.forget(sessionIds);
+                recovery.projectWorkspace();
+                sendJson(res, { ok: true });
+            } else if (requestUrl.pathname === "/api/recovery/checkpoint" && req.method === "POST") {
+                const { bootId } = await requestJson(req);
+                const checkpoint = recovery.checkpoints().find(c => c.bootId === bootId);
+                if (!checkpoint) throw new Error("Checkpoint not found");
+                recovery.include(checkpoint.data.sessions);
+                recovery.projectWorkspace();
+                sendJson(res, { ok: true, count: checkpoint.data.sessions.length });
+            } else sendJson(res, { error: "Unknown recovery endpoint" }, 404);
+        } catch (error) { sendJson(res, { error: error.message }, 400); }
+        return;
+    }
+    if (requestUrl.pathname === "/api/restore-status") {
+        const ids = new Set((requestUrl.searchParams.get("ids") || "").split(","));
+        sendJson(res, { results: recovery.list().filter(row => ids.has(row.id)).map(row => ({ id: row.id, state: row.state, error: row.error })) });
+        return;
+    }
     if (req.url === "/api/stream") {
         res.writeHead(200, {
             "Content-Type": "text/event-stream",
@@ -5007,27 +5215,11 @@ const server = createServer((req, res) => {
         return;
     }
     if (req.url === "/api/resume" && req.method === "POST") {
-        let body = "";
-        req.on("data", chunk => body += chunk);
-        req.on("end", () => {
-            try {
-                const { sessionId, cwd } = JSON.parse(body);
-                if (!sessionId) {
-                    res.writeHead(400, { "Content-Type": "application/json" });
-                    res.end(JSON.stringify({ error: "Missing sessionId" }));
-                    return;
-                }
-                const dir = cwd && existsSync(cwd) ? cwd : homedir();
-                // Open a new tab in Windows Terminal, cd to dir, and resume
-                const cmd = `wt -w 0 new-tab --title "Copilot: ${sessionId.slice(0, 8)}" -d "${dir}" cmd /k "${COPILOT_CMD} --resume=${sessionId}"`;
-                exec(cmd, () => {});
-                res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ ok: true }));
-            } catch (e) {
-                res.writeHead(500, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: String(e) }));
-            }
-        });
+        try {
+            const { sessionId } = await requestJson(req);
+            const results = await queueRecovery([sessionId]);
+            sendJson(res, { ok: !results.some(r => r.state === "failed"), results }, 202);
+        } catch (error) { sendJson(res, { error: error.message }, 400); }
         return;
     }
     if (req.url === "/api/open" && req.method === "POST") {
@@ -5115,18 +5307,13 @@ const server = createServer((req, res) => {
         req.on("end", () => {
             try {
                 const { title, altTitle, pid, cwd, sessionId } = JSON.parse(body);
-                sendFocusCommand(title, altTitle, cwd, (result) => {
+                sendFocusCommand(title, altTitle, cwd, async (result) => {
                     // If no matching tab was found, launch a new one
                     if ((result === "FOCUSED_WINDOW" || result === "NO_WT") && sessionId) {
-                        const dir = cwd && existsSync(cwd) ? cwd : homedir();
-                        const tabTitle = (title || `Copilot: ${sessionId.slice(0, 8)}`).replace(/"/g, "'");
-                        const resumeCmd = `${COPILOT_CMD} --resume=${sessionId}`;
-                        const cmd = result === "NO_WT"
-                            ? `wt --title "${tabTitle}" -d "${dir}" cmd /k "${resumeCmd}"`
-                            : `wt -w 0 new-tab --title "${tabTitle}" -d "${dir}" cmd /k "${resumeCmd}"`;
-                        exec(cmd, () => {});
-                        res.writeHead(200, { "Content-Type": "application/json" });
-                        res.end(JSON.stringify({ ok: true, action: "launched", result }));
+                        try {
+                            const results = await queueRecovery([sessionId]);
+                            sendJson(res, { ok: !results.some(r => r.state === "failed"), action: results[0].state, results });
+                        } catch (error) { sendJson(res, { error: error.message }, 400); }
                     } else {
                         res.writeHead(200, { "Content-Type": "application/json" });
                         res.end(JSON.stringify({ ok: true, action: "focused", result }));
@@ -5318,22 +5505,17 @@ const server = createServer((req, res) => {
     // --- Feature 12: Workspace save/restore ---
     if (req.url === "/api/workspace-status") {
         try {
-            if (existsSync(WORKSPACE_FILE)) {
-                const data = JSON.parse(readFileSync(WORKSPACE_FILE, "utf-8"));
-                res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ hasSaved: true, count: (data.sessions || []).length, savedAt: data.savedAt || "", restoredAt: data.restoredAt || "" }));
-            } else {
-                res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ hasSaved: false, count: 0 }));
-            }
+            const count = recovery.list().length;
+            let savedAt = "";
+            try { savedAt = JSON.parse(readFileSync(WORKSPACE_FILE, "utf8")).savedAt || ""; } catch {}
+            sendJson(res, { hasSaved: count > 0, count, savedAt });
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: String(e) })); }
         return;
     }
     if (req.url === "/api/save-workspace" && req.method === "POST") {
         try {
             autoSaveWorkspace();
-            const data = existsSync(WORKSPACE_FILE) ? JSON.parse(readFileSync(WORKSPACE_FILE, "utf-8")) : { sessions: [] };
-            const count = (data.sessions || []).length;
+            const count = recovery.list().length;
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: true, count }));
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: String(e) })); }
@@ -5341,55 +5523,8 @@ const server = createServer((req, res) => {
     }
     if (req.url === "/api/restore-workspace" && req.method === "POST") {
         try {
-            if (!existsSync(WORKSPACE_FILE)) {
-                res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ restored: 0, skippedAlive: 0, skippedMissing: 0, failed: 0 }));
-                return;
-            }
-            const data = JSON.parse(readFileSync(WORKSPACE_FILE, "utf-8"));
-            const savedSessions = data.sessions || [];
-            const currentSessions = scanSessions();
-            const aliveIds = new Set(currentSessions.filter(s => s.alive).map(s => s.id));
-
-            let restored = 0, skippedAlive = 0, skippedMissing = 0, failed = 0;
-
-            // Build list of sessions to restore
-            const toRestore = [];
-            for (const s of savedSessions) {
-                if (aliveIds.has(s.sessionId)) { skippedAlive++; continue; }
-                const sessionDir = join(SESSION_STATE_DIR, s.sessionId);
-                if (!existsSync(sessionDir)) { skippedMissing++; continue; }
-                toRestore.push(s);
-            }
-
-            // Launch each session in a new WT tab with staggered delays
-            const launchNext = (i) => {
-                if (i >= toRestore.length) return;
-                const s = toRestore[i];
-                const dir = s.cwd && existsSync(s.cwd) ? s.cwd : homedir();
-                const tabTitle = (s.summary ? `Copilot: ${s.summary.slice(0, 40)}` : `Copilot: ${s.sessionId.slice(0, 8)}`).replace(/"/g, "'");
-                const resumeCmd = `${COPILOT_CMD} --resume=${s.sessionId}`;
-                let cmd;
-                if (i === 0) {
-                    cmd = `wt --title "${tabTitle}" -d "${dir}" cmd /k "${resumeCmd}"`;
-                } else {
-                    cmd = `wt -w 0 new-tab --title "${tabTitle}" -d "${dir}" cmd /k "${resumeCmd}"`;
-                }
-                exec(cmd, () => {});
-                // Stagger launches by 800ms so WT can register each tab
-                if (i + 1 < toRestore.length) setTimeout(() => launchNext(i + 1), 800);
-            };
-            if (toRestore.length > 0) launchNext(0);
-            restored = toRestore.length;
-
-            // Mark as restored but keep the file
-            data.restoredAt = new Date().toISOString();
-            const tmpFile = WORKSPACE_FILE + ".tmp";
-            writeFileSync(tmpFile, JSON.stringify(data, null, 2));
-            renameSync(tmpFile, WORKSPACE_FILE);
-
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ restored, skippedAlive, skippedMissing, failed }));
+            const ids = recovery.list().map(row => row.id);
+            sendJson(res, { results: ids.length ? await queueRecovery(ids) : [] }, 202);
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: String(e) })); }
         return;
     }
@@ -5453,22 +5588,8 @@ const server = createServer((req, res) => {
                 }
                 const sessions = Array.isArray(parsed.sessions) ? parsed.sessions : [];
 
-                // Rotate current → backup chain so we don't lose it.
-                rotateWorkspaceBackups();
-
-                // Write the promoted snapshot as the new active file. Refresh
-                // savedAt so the UI shows "promoted just now" while preserving
-                // the original timestamp in a sibling field for traceability.
-                const payload = {
-                    version: parsed.version || 1,
-                    savedAt: new Date().toISOString(),
-                    promotedFromSlot: slotNum,
-                    promotedFromSavedAt: parsed.savedAt || "",
-                    sessions,
-                };
-                const tmpFile = WORKSPACE_FILE + ".tmp";
-                writeFileSync(tmpFile, JSON.stringify(payload, null, 2));
-                renameSync(tmpFile, WORKSPACE_FILE);
+                recovery.include(sessions);
+                recovery.projectWorkspace();
 
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ ok: true, count: sessions.length, slot: slotNum }));
@@ -5651,7 +5772,8 @@ const server = createServer((req, res) => {
     }
     if (req.url === "/api/clear-workspace" && req.method === "POST") {
         try {
-            if (existsSync(WORKSPACE_FILE)) unlinkSync(WORKSPACE_FILE);
+            recovery.forget(recovery.list().map(row => row.id));
+            recovery.projectWorkspace();
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end('{"ok":true}');
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: String(e) })); }
@@ -5781,8 +5903,8 @@ setInterval(() => {
     }
 }, POLL_INTERVAL_MS);
 
-// Auto-save workspace every minute (skip if no active sessions)
-setInterval(autoSaveWorkspace, AUTO_SAVE_INTERVAL_MS);
+// All instances register heartbeats; one leased coordinator discovers and restores.
+setInterval(() => { void recoveryTick(); }, 5000);
 
 // Auto-generate reports on startup (deferred so it doesn't block server) and every hour
 const REPORT_GEN_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
@@ -5841,5 +5963,18 @@ const session = await joinSession({
     ],
 });
 mainSession = session;
+function registerRecoverySession() {
+    if (!runtimeSnapshot.bootId) return;
+    recovery.register(recoveryMetadata(session.sessionId), { pid: process.pid, startedAt: observerStartedAt });
+    registeredSessionId = session.sessionId;
+    invalidateSessionCache();
+}
+registerRecoverySession();
+session.on(event => {
+    if (event.type === "session.start" || event.type === "session.resume") {
+        try { registerRecoverySession(); } catch (error) { console.warn("Session registration:", error.message); }
+    }
+});
+void recoveryTick();
 
 await session.log(`Session monitor running at http://127.0.0.1:${serverPort}`);

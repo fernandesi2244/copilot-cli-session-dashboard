@@ -3,5 +3,7 @@
   "version": "1.0.0",
   "description": "Live web dashboard for monitoring and managing Copilot CLI sessions",
   "main": "extension.mjs",
-  "type": "module"
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": { "test": "node --test" }
 }
