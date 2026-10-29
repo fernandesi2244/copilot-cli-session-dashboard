@@ -101,6 +101,26 @@ await import(${JSON.stringify(new URL("./extension.mjs", import.meta.url).href)}
     assert.equal(workspace.count, 1, "saved workspace must not count the archive or newly opened tabs");
     assert.equal(workspace.archiveCount, 2);
 
+    const legacyArchive = {
+        version: 2, savedAt: "2030-01-01T12:00:00Z",
+        sessions: [{ sessionId: id(1), cwd }, { sessionId: id(2), cwd }],
+    };
+    writeFileSync(join(directory, "saved-workspace.json"), JSON.stringify(legacyArchive));
+    writeFileSync(join(directory, "saved-workspace.json.10"), JSON.stringify(legacyArchive));
+    for (const [slot, version] of [[8, 3], [9, 1]]) {
+        writeFileSync(join(directory, `saved-workspace.json.${slot}`), JSON.stringify({
+            version, savedAt: "2020-06-04T12:00:00Z", sessions: [{ sessionId: id(2), cwd }],
+        }));
+    }
+    const snapshots = (await api("/api/workspace-backups")).data.snapshots;
+    const currentSnapshot = snapshots.find(s => s.slot === "current");
+    assert.equal(currentSnapshot.count, workspace.count, "the popup must use canonical membership despite legacy writers");
+    assert.equal(currentSnapshot.savedAt, workspace.savedAt);
+    assert.deepEqual(currentSnapshot.sessions.map(s => s.sessionId), [id(2)]);
+    assert.equal(snapshots.some(s => s.slot === 10), false, "merged recovery archives are not open-tab backups");
+    assert.ok(snapshots.some(s => s.slot === 8), "keep genuine version 3 backups");
+    assert.ok(snapshots.some(s => s.slot === 9), "keep genuine legacy version 1 backups");
+
     const page = await fetch(url + "/recovery").then(r => r.text());
     const browserScript = page.match(/<script>([\s\S]*?)<\/script>/)[1];
     new Script(browserScript);
@@ -147,6 +167,10 @@ console.log(JSON.stringify(['2024-03-10','2024-11-03'].map(day => {
     const saved = await api("/api/save-workspace", {});
     assert.equal(saved.data.count, 1, "manual save must use the currently open tabs, not the archive");
     assert.equal((await api("/api/recovery")).data.sessions.length, 3, "manual save must preserve older archive entries");
+    writeFileSync(join(directory, "saved-workspace.json"), JSON.stringify(legacyArchive));
+    const savedSnapshot = (await api("/api/workspace-backups")).data.snapshots.find(s => s.slot === "current");
+    assert.equal(savedSnapshot.count, saved.data.count);
+    assert.deepEqual(savedSnapshot.sessions.map(s => s.sessionId), [id(1)], "the saved list must reflect the newly saved open tabs");
     const currentRestore = await api("/api/restore-workspace", {});
     assert.deepEqual(currentRestore.data.results.map(r => [r.id, r.state]), [[id(1), "already-running"]]);
 

@@ -2350,9 +2350,9 @@ async function openWorkspaceBackups() {
     }
     const html = snaps.map((snap, idx) => {
       const isCurrent = snap.slot === 'current';
-      const label = isCurrent ? 'Active (saved-workspace.json)' : 'Backup .' + snap.slot;
+      const label = isCurrent ? 'Last saved open tabs' : 'Open-tab backup .' + snap.slot;
       const tagClass = isCurrent ? 'current' : '';
-      const tagText = isCurrent ? 'ACTIVE' : '#' + snap.slot;
+      const tagText = isCurrent ? 'SAVED' : '#' + snap.slot;
       const sessHtml = (snap.sessions || []).map(s => {
         const idShort = (s.sessionId || '').slice(0, 8);
         const summary = escapeHtml(s.summary || 'Untitled');
@@ -2381,7 +2381,7 @@ async function openWorkspaceBackups() {
         '<div class="ws-backup-sessions" id="wsBackupSess-' + idx + '">' + (sessHtml || '<div class="ws-backup-sess">(none)</div>') + '</div>' +
       '</div>';
     }).join('');
-    body.innerHTML = html;
+    body.innerHTML = '<p>Saved open-tab snapshots only. Older sessions remain in <a href="/recovery">Recovery</a>.</p>' + html;
     body.querySelectorAll('button[data-action="toggle"]').forEach(b => {
       b.addEventListener('click', () => {
         const el = document.getElementById('wsBackupSess-' + b.dataset.idx);
@@ -5540,12 +5540,14 @@ const server = createServer(async (req, res) => {
     }
     if (req.url === "/api/workspace-backups") {
         try {
-            const snapshots = [];
+            const workspace = recovery.workspace();
+            const snapshots = [{ slot: "current", ...workspace, count: workspace.sessions.length }];
             const readSnap = (path, slot) => {
                 if (!existsSync(path)) return null;
                 try {
                     const raw = readFileSync(path, "utf-8");
                     const data = JSON.parse(raw);
+                    if (data.version === 2) return null;
                     const sessions = Array.isArray(data.sessions) ? data.sessions : [];
                     let savedAt = data.savedAt || "";
                     if (!savedAt) {
@@ -5558,8 +5560,6 @@ const server = createServer(async (req, res) => {
                     return { slot, savedAt, count: 0, sessions: [], error: String(e) };
                 }
             };
-            const cur = readSnap(WORKSPACE_FILE, "current");
-            if (cur) snapshots.push(cur);
             for (let i = 1; i <= WORKSPACE_BACKUP_COUNT; i++) {
                 const snap = readSnap(`${WORKSPACE_FILE}.${i}`, i);
                 if (snap) snapshots.push(snap);
