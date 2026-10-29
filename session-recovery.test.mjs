@@ -80,12 +80,93 @@ test("upgrading an existing recovery database backfills the baseline without rep
     assert.equal(after.checkpoints().find(c => c.bootId === "legacy-import").data.sessions.length, 2);
 });
 
+test("saved workspace migrates the latest open-tab snapshot, never the merged archive", t => {
+    const f = fixture(t);
+    const one = f.session(1), two = f.session(2), three = f.session(3);
+    writeFileSync(join(f.directory, "saved-workspace.json"), JSON.stringify({
+        version: 2, savedAt: "2030-01-02T11:00:00Z", sessions: [one, two, three],
+    }));
+    writeFileSync(join(f.directory, "saved-workspace.json.2"), JSON.stringify({
+        version: 1, savedAt: "2030-01-01T11:00:00Z", sessions: [one],
+    }));
+    writeFileSync(join(f.directory, "saved-workspace.json.1"), JSON.stringify({
+        version: 1, savedAt: "2030-01-01T12:00:00Z", sessions: [two, { sessionId: id(99), cwd: f.directory }],
+    }));
+    const store = f.store();
+    assert.deepEqual(store.workspace().sessions.map(s => s.sessionId), [id(2)]);
+    assert.equal(store.list().length, 4, "archive membership must not be deleted");
+    store.observeWorkspace(f.runtime([f.process(3)]));
+    store.projectWorkspace();
+    assert.deepEqual(store.workspace().sessions.map(s => s.sessionId), [id(2)], "startup must preserve the recovery target");
+    assert.equal(JSON.parse(readFileSync(store.workspaceFile)).version, 3);
+    assert.equal(JSON.parse(readFileSync(store.workspaceFile)).sessions.length, 1);
+    const second = f.store();
+    assert.deepEqual(second.workspace(), store.workspace(), "migration must only run once");
+    store.saveWorkspace();
+    assert.deepEqual(store.workspace().sessions.map(s => s.sessionId), [id(3)]);
+});
+
+test("only confirmed open sessions enter live snapshots; missing, stale and partial discovery cannot inflate or erase them", t => {
+    const f = fixture(t), store = f.store();
+    store.observe([f.session(1), f.session(2), { sessionId: id(99), cwd: f.directory }]);
+    assert.equal(store.list().length, 2, "temporary observations without conversation history must not be retained");
+    store.observeWorkspace(f.runtime([f.process(1), f.process(2)]));
+    assert.equal(store.workspace().sessions.length, 2);
+    store.observe([f.session(1)]);
+    store.observeWorkspace(f.runtime([f.process(1), f.process(2)]));
+    assert.equal(store.workspace().sessions.length, 2, "a partial metadata scan must not hide a still-running archived session");
+    store.observeWorkspace(f.runtime([], false));
+    assert.equal(store.workspace().sessions.length, 2, "failed discovery cannot erase a workspace");
+    store.observeWorkspace({ ...f.runtime(), capturedAt: f.now() - 25000 });
+    store.observeWorkspace({ ...f.runtime(), bootId: "other-boot" });
+    assert.equal(store.workspace().sessions.length, 2, "stale or foreign-boot snapshots are not evidence");
+    store.observeWorkspace(f.runtime([f.process(2)]));
+    assert.deepEqual(store.workspace().sessions.map(s => s.sessionId), [id(2)], "confirmed closure removes only live membership");
+    assert.equal(store.list().length, 2);
+    store.observeWorkspace(f.runtime());
+    assert.equal(store.workspace().sessions.length, 0, "a confirmed empty workspace is distinct from failed discovery");
+});
+
+test("without an open-tab backup, migration never guesses a previous workspace from the archive", t => {
+    const f = fixture(t);
+    writeFileSync(join(f.directory, "saved-workspace.json"), JSON.stringify({
+        version: 2, savedAt: new Date(f.now()).toISOString(), sessions: [f.session(1), f.session(2)],
+    }));
+    const store = f.store();
+    assert.equal(store.workspace().sessions.length, 0);
+    assert.equal(store.list().length, 2);
+    store.observeWorkspace(f.runtime([f.process(2)]));
+    assert.deepEqual(store.workspace().sessions.map(s => s.sessionId), [id(2)]);
+});
+
+test("reboot freezes only the last confirmed open tabs while newer tabs and old writers leave the target intact", t => {
+    const f = fixture(t), before = f.store();
+    before.observe([f.session(1), f.session(2), f.session(3)]);
+    before.observeWorkspace(f.runtime([f.process(1), f.process(2)]));
+    before.observeWorkspace(f.runtime([f.process(2)]));
+    const after = f.store("boot-b");
+    assert.deepEqual(after.workspace().sessions.map(s => s.sessionId), [id(2)]);
+    after.observeWorkspace({ ...f.runtime([f.process(3)]), bootId: "boot-b" });
+    after.setMeta("boot", "old-writer-boot");
+    after.setMeta("coordinator", JSON.stringify({ owner: "old-writer", expiresAt: f.now() + 45000 }));
+    after.setBoot("boot-b");
+    assert.equal(after.claimCoordinator(), true, "old coordinators must not block live-workspace capture");
+    assert.deepEqual(after.workspace().sessions.map(s => s.sessionId), [id(2)]);
+    assert.deepEqual(after.checkpoints().find(c => c.bootId === "boot-a").data.sessions.map(s => s.sessionId), [id(2)]);
+    after.forget(id(2));
+    assert.equal(after.workspace().sessions.length, 0);
+    assert.equal(after.checkpoints().find(c => c.bootId === "boot-a").data.sessions.length, 1, "forgetting cannot mutate the checkpoint");
+    const next = f.store("boot-c");
+    assert.deepEqual(next.workspace().sessions.map(s => s.sessionId), [id(3)], "the next boot uses its immediately preceding live workspace");
+});
+
 test("connections share membership and a single expiring coordinator lease", t => {
     const f = fixture(t), a = f.store(), b = f.store();
     a.observe([f.session(1)]);
     b.observe([f.session(2)]);
     assert.equal(a.claimCoordinator(), true);
     assert.equal(b.claimCoordinator(), false);
+    a.observeWorkspace(f.runtime([f.process(1), f.process(2)]));
     assert.equal(a.projectWorkspace(), true);
     assert.equal(b.projectWorkspace(), false);
     assert.equal(JSON.parse(readFileSync(a.workspaceFile)).sessions.length, 2);
@@ -96,6 +177,7 @@ test("connections share membership and a single expiring coordinator lease", t =
     assert.equal(b.claimCoordinator(), true);
     assert.equal(a.claimCoordinator(), false);
     b.observe([f.session(3)]);
+    b.observeWorkspace(f.runtime([f.process(1), f.process(2), f.process(3)]));
     b.projectWorkspace();
     assert.equal(JSON.parse(readFileSync(a.workspaceFile + ".1")).sessions.length, 2);
 });
@@ -104,6 +186,7 @@ test("previous-boot checkpoints survive observations, forgetting, and rolling ba
     const f = fixture(t), before = f.store();
     before.observe([f.session(1), f.session(2)]);
     before.queue([id(1)], f.runtime());
+    before.observeWorkspace(f.runtime([f.process(1), f.process(2)]));
     before.projectWorkspace();
     const after = f.store("boot-b");
     assert.equal(after.list()[0].state, "interrupted");
@@ -122,6 +205,7 @@ test("previous-boot checkpoints survive observations, forgetting, and rolling ba
 test("a delayed boot lookup checkpoints the old roster before registering the new session", t => {
     const f = fixture(t), before = f.store();
     before.observe([f.session(1)]);
+    before.observeWorkspace(f.runtime([f.process(1)]));
     const after = f.store(null);
     assert.equal(after.bootId, "unknown");
     after.setBoot("boot-b");
@@ -160,6 +244,19 @@ test("a current SDK session supersedes stale resume arguments after an in-place 
     assert.equal(JSON.stringify(shareRuntime(node)).includes("do-not-persist"), false);
 });
 
+test("legacy SDK registrations remain usable on the same stable Windows boot", t => {
+    const f = fixture(t), store = f.store("windows-boot-55");
+    const bootStartedAt = "2030-01-02T08:00:00Z";
+    store.register(f.session(1), { pid: 101, startedAt: f.now() - 1000 });
+    store.db.prepare("UPDATE observers SET boot_id=?").run("2030-01-02T08:00:04Z");
+    const host = { ...f.process(1, 100), commandLine: "copilot" };
+    const child = { pid: 101, parentPid: 100, name: "node.exe", startedAt: new Date(f.now() - 1000).toISOString() };
+    const runtime = { ...f.runtime([host, child]), bootId: "windows-boot-55", bootStartedAt };
+    assert.equal(sessionPresence(store, id(1), runtime).alive, true);
+    store.db.prepare("UPDATE observers SET boot_id=?").run("2030-01-01T08:00:04Z");
+    assert.equal(sessionPresence(store, id(1), runtime).alive, false);
+});
+
 test("legacy locks require a CLI process whose birth predates the lock", t => {
     const f = fixture(t), store = f.store();
     f.session(1);
@@ -177,7 +274,7 @@ test("legacy locks require a CLI process whose birth predates the lock", t => {
 
 test("restore requests deduplicate across connections and fail visibly on missing prerequisites", t => {
     const f = fixture(t), a = f.store(), b = f.store();
-    a.observe([f.session(1), { sessionId: id(2), cwd: f.directory }, { ...f.session(3), cwd: join(f.directory, "missing") }, f.session(4)]);
+    a.include([f.session(1), { sessionId: id(2), cwd: f.directory }, { ...f.session(3), cwd: join(f.directory, "missing") }, f.session(4)]);
     assert.equal(a.queue([id(1)], f.runtime())[0].state, "queued");
     const token = a.list()[0].attempt_id;
     assert.equal(b.queue([id(1)], f.runtime())[0].state, "queued");

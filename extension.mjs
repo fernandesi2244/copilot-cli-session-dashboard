@@ -80,7 +80,9 @@ const WORKSPACE_BACKUP_COUNT = 10; // keep N rolling snapshots (.1 = newest)
 let runtimeSnapshot = { healthy: false, processes: [], capturedAt: 0 };
 try { runtimeSnapshot = await readRuntimeProcesses(); }
 catch (error) { console.warn("Session process discovery:", error.message); }
-const recovery = new RecoveryStore({ directory: join(homedir(), ".copilot"), bootId: runtimeSnapshot.bootId });
+const recovery = new RecoveryStore({
+    directory: join(homedir(), ".copilot"), bootId: runtimeSnapshot.bootId, bootStartedAt: runtimeSnapshot.bootStartedAt,
+});
 const observerStartedAt = Math.round(Date.now() - process.uptime() * 1000);
 let runtimeRefresh = null;
 let recoveryTickRunning = false;
@@ -88,7 +90,7 @@ let registeredSessionId = null;
 const discoveredRecoveries = new Map();
 
 async function refreshRuntime() {
-    const shared = recovery.meta("runtime");
+    const shared = recovery.meta("workspace-runtime");
     if (shared) {
         const snapshot = JSON.parse(shared);
         if (Date.now() - snapshot.capturedAt < 10000) runtimeSnapshot = snapshot;
@@ -100,7 +102,7 @@ async function refreshRuntime() {
         recovery.setBoot(snapshot.bootId);
         if (mainSession && registeredSessionId !== mainSession.sessionId) registerRecoverySession();
         // Share identity evidence, never arbitrary process arguments.
-        recovery.setMeta("runtime", JSON.stringify(shareRuntime(snapshot)));
+        recovery.setMeta("workspace-runtime", JSON.stringify(shareRuntime(snapshot)));
         return runtimeSnapshot;
     }).catch(error => {
         runtimeSnapshot = { ...runtimeSnapshot, healthy: false };
@@ -115,7 +117,7 @@ function recoveryMetadata(id) {
     let meta = {};
     try { meta = parseYaml(readFileSync(join(SESSION_STATE_DIR, id, "workspace.yaml"), "utf8")); } catch {}
     const discovered = discoveredRecoveries.get(id) || {};
-    return { sessionId: id, cwd: meta.cwd || discovered.cwd || "", summary: meta.summary || discovered.summary || "", branch: meta.branch || "", repository: meta.repository || "" };
+    return { sessionId: id, cwd: meta.cwd || discovered.cwd || "", summary: meta.summary || meta.name || discovered.summary || "", branch: meta.branch || "", repository: meta.repository || "" };
 }
 
 async function recoveryTick() {
@@ -125,13 +127,14 @@ async function recoveryTick() {
     recoveryTickRunning = true;
     try {
         if (!recovery.claimCoordinator()) {
-            const shared = recovery.meta("runtime");
+            const shared = recovery.meta("workspace-runtime");
             if (shared) runtimeSnapshot = JSON.parse(shared);
             return;
         }
         await refreshRuntime();
         invalidateSessionCache();
         recovery.observe(scanSessions().filter(s => s.alive).map(s => ({ ...s, summary: s.baseSummary || s.summary })));
+        recovery.observeWorkspace(runtimeSnapshot);
         recovery.projectWorkspace();
         await recovery.tickRestores(runtimeSnapshot, session => launchSessionTab(session, COPILOT_CMD));
     } catch (error) { console.warn("Session recovery:", error.message); }
@@ -1035,6 +1038,7 @@ function _scanSessionsUncached() {
         // Parse workspace.yaml
         let meta = {};
         try { meta = parseYaml(readFileSync(wsPath, "utf-8")); } catch {}
+        if (!meta.cwd || !existsSync(eventsPath)) continue;
 
         // Skip sessions in excluded directories
         const cwdVal = meta.cwd || "";
@@ -1100,8 +1104,8 @@ function _scanSessionsUncached() {
 
         results.push({
             id: name,
-            summary: (isAlive && progressInfo.latestIntent) ? progressInfo.latestIntent : (meta.summary || "Untitled Session"),
-            baseSummary: meta.summary || "Untitled Session",
+            summary: (isAlive && progressInfo.latestIntent) ? progressInfo.latestIntent : (meta.summary || meta.name || "Untitled Session"),
+            baseSummary: meta.summary || meta.name || "Untitled Session",
             cwd: meta.cwd || "",
             branch: meta.branch || "",
             repository: meta.repository || "",
@@ -2148,7 +2152,7 @@ async function checkWorkspaceStatus() {
       let badge = btn.querySelector('.ws-restore-badge');
       if (!badge) { badge = document.createElement('span'); badge.className = 'ws-restore-badge'; btn.appendChild(badge); }
       badge.textContent = data.count;
-      btn.title = 'Restore ' + data.count + ' saved sessions (saved ' + timeAgo(data.savedAt) + ')';
+      btn.title = 'Restore ' + data.count + ' sessions from the last saved open-tab snapshot (saved ' + timeAgo(data.savedAt) + '). Older sessions are in Recovery.';
     } else {
       btn.style.display = 'none';
     }
@@ -2268,10 +2272,11 @@ document.getElementById('saveWorkspaceBtn').addEventListener('click', async () =
   try {
     const resp = await fetch('/api/save-workspace', { method: 'POST' });
     const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Save failed');
     if (data.count > 0) {
-      showToast('💾 Workspace Saved', data.count + ' sessions retained for recovery, including currently closed sessions.', 'success');
+      showToast('💾 Workspace Saved', data.count + ' open sessions saved. Older sessions remain in Recovery.', 'success');
     } else {
-      showToast('💾 No Sessions', 'No tracked sessions to save.', '');
+      showToast('💾 No Sessions', 'No confirmed open sessions to save. Recovery history is unchanged.', '');
     }
     checkWorkspaceStatus();
   } catch { showToast('❌ Save Failed', 'Could not save workspace.', 'error'); }
@@ -2312,7 +2317,7 @@ document.getElementById('restoreWorkspaceBtn').addEventListener('click', async (
   try {
     const st = await fetch('/api/workspace-status').then(r => r.json());
     if (!st.hasSaved || st.count === 0) { showToast('No Saved Workspace', '', ''); return; }
-    if (!confirm('Restore all ' + st.count + ' tracked sessions? Closed sessions remain tracked until explicitly forgotten. Use Recovery to choose a subset.')) return;
+    if (!confirm('Restore ' + st.count + ' sessions from the last saved open-tab snapshot? Already-running sessions will be skipped. Older sessions remain in Recovery.')) return;
   } catch { return; }
   const orig = btn.textContent;
   btn.textContent = '⏳';
@@ -4466,7 +4471,7 @@ load();
 
 function autoSaveWorkspace() {
     recovery.observe(scanSessions().filter(s => s.alive).map(s => ({ ...s, summary: s.baseSummary || s.summary })));
-    recovery.projectWorkspace();
+    return recovery.observeWorkspace(runtimeSnapshot);
 }
 
 // --- Reports HTML page ---
@@ -4999,11 +5004,12 @@ code { user-select:all; } .error { color:#f85149; } td:first-child { width:30px;
 td small { display:block; overflow-wrap:anywhere; } :focus-visible { outline:2px solid var(--link); outline-offset:2px; }
 </style></head><body>
 <header><a href="/">Back to monitor</a><h1>Session Recovery</h1><button id="theme" aria-label="Toggle light/dark theme">Theme</button></header>
-<p>Sessions stay in recovery until explicitly forgotten. Closing a tab, a partial scan, or a reboot never removes them.
+<p>This archive includes older sessions, not just the saved open-tab workspace. Sessions stay here until explicitly forgotten.
+Closing a tab removes it from the next confirmed live snapshot, not from this archive. Unavailable process discovery never replaces a snapshot.
 Restores open at most two sessions at a time; "resumed" requires a new resume event and a running session.</p>
 <div class="toolbar">
 <label for="day">Resumed on (local date)</label><input id="day" type="date">
-<button id="find">Search history</button><button id="roster">Show recovery roster</button>
+<button id="find">Search history</button><button id="roster">Show recovery archive</button>
 <span class="hint" id="timezone"></span>
 </div>
 <div class="toolbar">
@@ -5056,6 +5062,7 @@ async function refresh() {
       '<td>' + escape((s.lastResumedAt || s.lastOpenedAt) ? new Date(s.lastResumedAt || s.lastOpenedAt).toLocaleString() : 'Not recorded') +
       (s.evidenceLine ? '<small>events.jsonl line ' + s.evidenceLine + ' (' + s.count + ' resume events)</small>' : '') + '</td>' +
       '<td>' + escape(s.liveness || 'not checked') + ' / ' + escape(s.state || 'not tracked') +
+      (s.available === false ? '<small class="error">History or working directory is unavailable; excluded from the saved workspace.</small>' : '') +
       (s.error ? '<small class="error">' + escape(s.error) + '</small>' : '') + '</td></tr>').join('') || '<tr><td colspan="5">No sessions found.</td></tr>';
     const checkpoint = el('checkpoint').value;
     el('checkpoint').innerHTML = data.checkpoints.map(c => '<option value="' + escape(c.bootId) + '">' +
@@ -5138,7 +5145,7 @@ const server = createServer(async (req, res) => {
             if (requestUrl.pathname === "/api/recovery" && req.method === "GET") {
                 sendJson(res, {
                     sessions: recovery.list().map(row => ({
-                        ...row.metadata, state: row.state, error: row.error,
+                        ...row.metadata, state: row.state, error: row.error, available: recovery.canRestore(row.metadata),
                         lastOpenedAt: row.last_opened_at ? new Date(row.last_opened_at).toISOString() : null,
                         ...sessionPresence(recovery, row.id, runtimeSnapshot),
                     })),
@@ -5505,17 +5512,20 @@ const server = createServer(async (req, res) => {
     // --- Feature 12: Workspace save/restore ---
     if (req.url === "/api/workspace-status") {
         try {
-            const count = recovery.list().length;
-            let savedAt = "";
-            try { savedAt = JSON.parse(readFileSync(WORKSPACE_FILE, "utf8")).savedAt || ""; } catch {}
-            sendJson(res, { hasSaved: count > 0, count, savedAt });
+            const workspace = recovery.workspace();
+            const count = workspace.sessions.length;
+            sendJson(res, { hasSaved: count > 0, count, savedAt: workspace.savedAt, source: workspace.source, archiveCount: recovery.list().length });
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: String(e) })); }
         return;
     }
     if (req.url === "/api/save-workspace" && req.method === "POST") {
         try {
-            autoSaveWorkspace();
-            const count = recovery.list().length;
+            await refreshRuntime();
+            invalidateSessionCache();
+            if (!autoSaveWorkspace()) throw new Error("Process discovery is unavailable; the saved workspace was not changed");
+            recovery.saveWorkspace();
+            recovery.projectWorkspace();
+            const count = recovery.workspace().sessions.length;
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: true, count }));
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: String(e) })); }
@@ -5523,7 +5533,7 @@ const server = createServer(async (req, res) => {
     }
     if (req.url === "/api/restore-workspace" && req.method === "POST") {
         try {
-            const ids = recovery.list().map(row => row.id);
+            const ids = recovery.workspace().sessions.map(session => session.sessionId);
             sendJson(res, { results: ids.length ? await queueRecovery(ids) : [] }, 202);
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: String(e) })); }
         return;

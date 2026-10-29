@@ -21,9 +21,11 @@ test("HTTP recovery flows use an isolated home, fake SDK, and fake terminal", as
             type: "session.resume", timestamp: n === 3 ? "2020-06-05T12:00:00Z" : "2020-06-04T12:00:00Z",
             data: { context: { cwd } },
         }) + "\n");
-        if (n !== 3) writeFileSync(join(path, "workspace.yaml"), `summary: Session ${n}\ncwd: ${cwd}\n`);
+        if (n !== 3) writeFileSync(join(path, "workspace.yaml"), `name: Session ${n}\ncwd: ${cwd}\n`);
     }
-    writeFileSync(join(directory, "saved-workspace.json"), JSON.stringify({ sessions: [{ sessionId: id(2), cwd }] }));
+    writeFileSync(join(directory, "saved-workspace.json"), JSON.stringify({
+        version: 1, savedAt: "2020-06-05T12:00:00Z", sessions: [{ sessionId: id(2), cwd }],
+    }));
 
     // Nothing in the extension may reach the real SDK, user home, shell, or terminal.
     const script = `
@@ -93,7 +95,11 @@ await import(${JSON.stringify(new URL("./extension.mjs", import.meta.url).href)}
     const initial = (await api("/api/recovery")).data;
     assert.equal(initial.sessions.length, 2);
     assert.equal(initial.sessions.find(s => s.sessionId === id(1)).alive, true);
+    assert.equal(initial.sessions.find(s => s.sessionId === id(1)).summary, "Session 1");
     assert.equal(initial.checkpoints[0].bootId, "legacy-import");
+    const workspace = (await api("/api/workspace-status")).data;
+    assert.equal(workspace.count, 1, "saved workspace must not count the archive or newly opened tabs");
+    assert.equal(workspace.archiveCount, 2);
 
     const page = await fetch(url + "/recovery").then(r => r.text());
     const browserScript = page.match(/<script>([\s\S]*?)<\/script>/)[1];
@@ -137,7 +143,12 @@ console.log(JSON.stringify(['2024-03-10','2024-11-03'].map(day => {
     const restored = await api("/api/restore-workspace", {});
     assert.equal(restored.status, 202);
     assert.equal(restored.data.restored, undefined, "a queued launch must never be reported as restored");
-    assert.equal(restored.data.results.find(r => r.id === id(1)).state, "already-running");
+    assert.deepEqual(restored.data.results.map(r => r.id), [id(2)], "bulk restore must not launch unrelated archived sessions");
+    const saved = await api("/api/save-workspace", {});
+    assert.equal(saved.data.count, 1, "manual save must use the currently open tabs, not the archive");
+    assert.equal((await api("/api/recovery")).data.sessions.length, 3, "manual save must preserve older archive entries");
+    const currentRestore = await api("/api/restore-workspace", {});
+    assert.deepEqual(currentRestore.data.results.map(r => [r.id, r.state]), [[id(1), "already-running"]]);
 
     await api("/api/recovery/forget", { sessionIds: [id(3)] });
     assert.equal(existsSync(join(directory, "session-state", id(3), "events.jsonl")), true);

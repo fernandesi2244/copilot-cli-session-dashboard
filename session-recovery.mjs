@@ -56,6 +56,7 @@ export async function readRuntimeProcesses() {
     const script = `
 $ErrorActionPreference = 'Stop'
 $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+$bootCounter = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters' -Name BootId -ErrorAction SilentlyContinue).BootId
 $processes = @(Get-CimInstance Win32_Process | ForEach-Object {
     [pscustomobject]@{
         pid = $_.ProcessId
@@ -65,7 +66,7 @@ $processes = @(Get-CimInstance Win32_Process | ForEach-Object {
         commandLine = $(if ($_.Name -match '^(copilot|node|cmd)\\.exe$') { $_.CommandLine } else { '' })
     }
 })
-@{bootId=$boot; processes=$processes} | ConvertTo-Json -Depth 4 -Compress
+@{bootId=$(if ($null -ne $bootCounter) { "windows-boot-$bootCounter" } else { $boot }); bootStartedAt=$boot; processes=$processes} | ConvertTo-Json -Depth 4 -Compress
 `;
     const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
         windowsHide: true, timeout: 15000, maxBuffer: 8 * 1024 * 1024,
@@ -95,9 +96,12 @@ export function sessionPresence(store, id, runtime) {
     const now = store.now();
     const fresh = runtime?.healthy && now - runtime.capturedAt < HEARTBEAT_TTL;
     const processes = fresh ? runtime.processes : [];
+    const sameBoot = observer => observer.boot_id === store.bootId
+        || (runtime?.bootId === store.bootId
+            && Math.abs(Date.parse(observer.boot_id) - Date.parse(runtime.bootStartedAt)) < 60000);
     const registrations = [];
     for (const observer of store.observers()) {
-        if (observer.boot_id !== store.bootId || now - observer.heartbeat_at >= HEARTBEAT_TTL) continue;
+        if (!sameBoot(observer) || now - observer.heartbeat_at >= HEARTBEAT_TTL) continue;
         const p = processes.find(p => p.pid === observer.pid);
         if (!p || !(Math.abs(Date.parse(p.startedAt) - observer.started_at) < 2000)) continue;
         let host = p, ancestor = p;
@@ -117,7 +121,7 @@ export function sessionPresence(store, id, runtime) {
     const cli = matching.find(p => isCliProcess(p) && !assignedElsewhere(p));
     if (cli) return { alive: true, pid: cli.pid, processStartedAt: cli.startedAt, liveness: "running", source: "process" };
     for (const observer of store.observers(id)) {
-        if (observer.boot_id !== store.bootId || now - observer.heartbeat_at >= HEARTBEAT_TTL) continue;
+        if (!sameBoot(observer) || now - observer.heartbeat_at >= HEARTBEAT_TTL) continue;
         // A fresh SDK heartbeat remains useful on platforms without process enumeration.
         if (process.platform !== "win32" && !runtime?.healthy) {
             try {
@@ -181,7 +185,7 @@ async function readAppendedResumes(file, offset, since) {
 }
 
 export class RecoveryStore {
-    constructor({ directory, bootId = null, now = Date.now, instanceId = randomUUID() }) {
+    constructor({ directory, bootId = null, bootStartedAt = null, now = Date.now, instanceId = randomUUID() }) {
         this.directory = directory;
         this.sessionDirectory = join(directory, "session-state");
         this.workspaceFile = join(directory, "saved-workspace.json");
@@ -237,6 +241,27 @@ export class RecoveryStore {
                 }
                 this.setMeta("baseline-created", "1");
             }
+            if (!this.meta("workspace-separated")) {
+                const snapshots = [];
+                for (let slot = 0; slot <= 10; slot++) {
+                    try {
+                        const saved = readJson(this.workspaceFile + (slot ? `.${slot}` : ""));
+                        // Version 2 projected the entire archive, not the open tabs.
+                        if (saved.version === 2 || !Array.isArray(saved.sessions) || !Number.isFinite(Date.parse(saved.savedAt))) continue;
+                        const sessions = saved.sessions.filter(session => this.canRestore(session)).map(sessionMetadata);
+                        if (sessions.length || saved.sessions.length === 0) snapshots.push({ savedAt: saved.savedAt, sessions });
+                    } catch {}
+                }
+                snapshots.sort((a, b) => Date.parse(b.savedAt) - Date.parse(a.savedAt));
+                if (snapshots.length) {
+                    const snapshot = { ...snapshots[0], source: "legacy-snapshot" };
+                    this.setMeta("saved-workspace", JSON.stringify(snapshot));
+                    if (bootId && Date.parse(snapshot.savedAt) >= Date.parse(bootStartedAt)) {
+                        this.setMeta("live-workspace", JSON.stringify({ ...snapshot, bootId }));
+                    }
+                }
+                this.setMeta("workspace-separated", "1");
+            }
         });
         if (bootId) this.setBoot(bootId);
     }
@@ -244,15 +269,19 @@ export class RecoveryStore {
     setBoot(bootId) {
         if (!bootId) return;
         this.transaction(() => {
-            const previousBoot = this.meta("boot");
+            const previousBoot = this.meta("workspace-boot") || this.meta("boot");
             if (previousBoot && previousBoot !== bootId) {
-                const saved = { version: 2, savedAt: new Date(this.now()).toISOString(), sessions: this.list().map(s => s.metadata) };
-                this.db.prepare("INSERT OR IGNORE INTO checkpoints VALUES (?, ?, ?)")
-                    .run(previousBoot, saved.savedAt, JSON.stringify(saved));
+                const live = JSON.parse(this.meta("live-workspace") || "null");
+                if (live?.bootId === previousBoot) {
+                    const saved = { ...live, version: 3, source: "previous-boot" };
+                    this.setMeta("saved-workspace", JSON.stringify(saved));
+                    this.db.prepare("INSERT OR IGNORE INTO checkpoints VALUES (?, ?, ?)")
+                        .run(previousBoot, saved.savedAt, JSON.stringify(saved));
+                }
                 this.db.prepare("UPDATE roster SET state='interrupted', error='Computer restarted before restore confirmation' WHERE state IN ('queued','launching')").run();
-                this.db.prepare("DELETE FROM metadata WHERE key='coordinator'").run();
+                this.db.prepare("DELETE FROM metadata WHERE key='workspace-coordinator'").run();
             }
-            this.setMeta("boot", bootId);
+            this.setMeta("workspace-boot", bootId);
             this.bootId = bootId;
         });
     }
@@ -297,7 +326,11 @@ export class RecoveryStore {
     }
 
     observe(sessions) {
-        this.transaction(() => { for (const session of sessions) this.remember(session); });
+        this.transaction(() => {
+            for (const session of sessions) {
+                if (this.canRestore(session)) this.remember(session);
+            }
+        });
     }
 
     include(sessions) {
@@ -335,6 +368,46 @@ export class RecoveryStore {
             .map(row => ({ ...row, metadata: JSON.parse(row.payload) }));
     }
 
+    canRestore(session) {
+        try {
+            const id = validateSessionId(session.sessionId || session.id);
+            return Boolean(session.cwd && statSync(session.cwd).isDirectory()
+                && statSync(join(this.sessionDirectory, id, "events.jsonl")).isFile());
+        } catch { return false; }
+    }
+
+    observeWorkspace(runtime) {
+        if (!runtime?.healthy || runtime.bootId !== this.bootId || this.now() - runtime.capturedAt >= HEARTBEAT_TTL) return false;
+        this.transaction(() => {
+            const sessions = this.list().filter(row => this.canRestore(row.metadata)
+                && sessionPresence(this, row.id, runtime).alive).map(row => row.metadata);
+            const previous = JSON.parse(this.meta("live-workspace") || "null");
+            if (previous?.bootId !== this.bootId || JSON.stringify(previous.sessions) !== JSON.stringify(sessions)) {
+                this.setMeta("live-workspace", JSON.stringify({
+                    bootId: this.bootId, savedAt: new Date(this.now()).toISOString(), source: "live", sessions,
+                }));
+            }
+        });
+        return true;
+    }
+
+    saveWorkspace() {
+        const live = JSON.parse(this.meta("live-workspace") || "null");
+        if (!live || live.bootId !== this.bootId) throw new Error("No confirmed open-tab snapshot is available");
+        this.setMeta("saved-workspace", JSON.stringify({ ...live, source: "manual-save" }));
+    }
+
+    workspace() {
+        const saved = JSON.parse(this.meta("saved-workspace") || this.meta("live-workspace") || "null");
+        const retained = new Map(this.list().map(row => [row.id, row.metadata]));
+        return {
+            savedAt: saved?.savedAt || "", source: saved?.source || "none", bootId: saved?.bootId || null,
+            sessions: (saved?.sessions || []).filter(session => retained.has(session.sessionId) && this.canRestore(session))
+                .map(session => ({ ...session, ...retained.get(session.sessionId) }))
+                .sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
+        };
+    }
+
     forget(ids) {
         ids = (Array.isArray(ids) ? ids : [ids]).map(validateSessionId);
         this.transaction(() => {
@@ -347,22 +420,20 @@ export class RecoveryStore {
 
     claimCoordinator() {
         return this.transaction(() => {
-            const lease = JSON.parse(this.meta("coordinator") || "null");
+            const lease = JSON.parse(this.meta("workspace-coordinator") || "null");
             if (lease && lease.owner !== this.instanceId && lease.expiresAt > this.now()) return false;
-            this.setMeta("coordinator", JSON.stringify({ owner: this.instanceId, bootId: this.bootId, expiresAt: this.now() + LEASE_TTL }));
+            this.setMeta("workspace-coordinator", JSON.stringify({ owner: this.instanceId, bootId: this.bootId, expiresAt: this.now() + LEASE_TTL }));
             return true;
         });
     }
 
     projectWorkspace() {
         if (!this.claimCoordinator()) return false;
-        const sessions = this.list().map(row => ({
-            ...row.metadata,
-            lastOpenedAt: row.last_opened_at ? new Date(row.last_opened_at).toISOString() : null,
-        }));
+        const workspace = this.workspace();
+        const sessions = workspace.sessions;
         let previous = null;
         try { previous = readJson(this.workspaceFile); } catch {}
-        if (JSON.stringify(previous?.sessions) !== JSON.stringify(sessions) || previous?.bootId !== this.bootId) {
+        if (JSON.stringify(previous?.sessions) !== JSON.stringify(sessions) || previous?.version !== 3 || previous?.savedAt !== workspace.savedAt) {
             const previousIds = (previous?.sessions || []).map(s => s.sessionId).sort();
             if (previous && JSON.stringify(previousIds) !== JSON.stringify(sessions.map(s => s.sessionId))) {
                 for (let slot = 9; slot >= 0; slot--) {
@@ -370,7 +441,7 @@ export class RecoveryStore {
                     if (existsSync(source)) copyFileSync(source, `${this.workspaceFile}.${slot + 1}`);
                 }
             }
-            atomicJson(this.workspaceFile, { version: 2, bootId: this.bootId, savedAt: new Date(this.now()).toISOString(), sessions });
+            atomicJson(this.workspaceFile, { version: 3, ...workspace });
         }
         const checkpointDirectory = join(this.directory, "workspace-checkpoints");
         mkdirSync(checkpointDirectory, { recursive: true });
