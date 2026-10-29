@@ -90,7 +90,7 @@ let registeredSessionId = null;
 const discoveredRecoveries = new Map();
 
 async function refreshRuntime() {
-    const shared = recovery.meta("open-tabs:runtime");
+    const shared = recovery.meta("workspace-history:runtime");
     if (shared) {
         const snapshot = JSON.parse(shared);
         if (Date.now() - snapshot.capturedAt < 10000) runtimeSnapshot = snapshot;
@@ -102,7 +102,7 @@ async function refreshRuntime() {
         recovery.setBoot(snapshot.bootId, snapshot.bootStartedAt);
         if (mainSession && registeredSessionId !== mainSession.sessionId) registerRecoverySession();
         // Share identity evidence, never arbitrary process arguments.
-        recovery.setMeta("open-tabs:runtime", JSON.stringify(shareRuntime(snapshot)));
+        recovery.setMeta("workspace-history:runtime", JSON.stringify(shareRuntime(snapshot)));
         return runtimeSnapshot;
     }).catch(error => {
         runtimeSnapshot = { ...runtimeSnapshot, healthy: false };
@@ -127,7 +127,7 @@ async function recoveryTick() {
     recoveryTickRunning = true;
     try {
         if (!recovery.claimCoordinator()) {
-            const shared = recovery.meta("open-tabs:runtime");
+            const shared = recovery.meta("workspace-history:runtime");
             if (shared) runtimeSnapshot = JSON.parse(shared);
             return;
         }
@@ -141,10 +141,10 @@ async function recoveryTick() {
     finally { recoveryTickRunning = false; }
 }
 
-async function queueRecovery(ids) {
+async function queueRecovery(ids, metadata = null) {
     if (!Array.isArray(ids) || !ids.length) throw new Error("Select at least one session");
     const unique = [...new Set(ids.map(validateSessionId))];
-    recovery.include(unique.map(recoveryMetadata));
+    recovery.include(metadata || unique.map(recoveryMetadata));
     await refreshRuntime();
     const results = recovery.queue(unique, runtimeSnapshot);
     void recoveryTick();
@@ -1816,7 +1816,7 @@ function dashboardHtml() {
   <button class="header-btn" id="exportSessionIdsBtn" title="Save active session IDs to Downloads">⬇️</button>
   <button class="header-btn" id="saveWorkspaceBtn" title="Save all active sessions for later restore">💾</button>
   <button class="header-btn" id="restoreWorkspaceBtn" title="Restore previously saved sessions" style="display:none;">🔄</button>
-  <button class="header-btn" id="workspaceBackupsBtn" title="Browse snapshots and add their sessions to recovery">📜</button>
+  <button class="header-btn" id="workspaceBackupsBtn" title="Preview and restore an exact earlier workspace">📜</button>
   <a href="/recovery" class="header-btn" title="Recover sessions by date or previous boot" style="text-decoration:none;">Recovery</a>
   <button class="header-btn" id="screenBlankBtn" title="Blank all screens (click/key/mouse to dismiss)">&#x1f5a5;&#xfe0f;</button>
   <button class="header-btn" id="cancelLockBtn" title="Cancel computer lock" style="display:none;background:#b62324;color:#fff;border-color:#b62324;font-weight:700;min-width:90px;">🔓 3s</button>
@@ -2336,23 +2336,55 @@ function escapeHtml(s) {
   return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-async function openWorkspaceBackups() {
+let workspaceSnapshots = [];
+let workspaceSnapshotCursor = null;
+let workspaceSnapshotsLoading = false;
+let workspaceLiveId = null;
+let workspaceSavedId = null;
+let workspaceDiscoveryHealthy = false;
+
+async function openWorkspaceBackups(before = null) {
+  if (workspaceSnapshotsLoading) return;
+  workspaceSnapshotsLoading = true;
   const overlay = document.getElementById('wsBackupsModal');
   const body = document.getElementById('wsBackupsBody');
   overlay.classList.add('open');
-  body.innerHTML = '<div class="ws-modal-empty">Loading snapshots…</div>';
+  if (before === null) {
+    workspaceSnapshots = [];
+    body.innerHTML = '<div class="ws-modal-empty">Loading snapshots…</div>';
+  }
   try {
-    const data = await fetch('/api/workspace-backups').then(r => r.json());
-    const snaps = data.snapshots || [];
-    if (snaps.length === 0) {
+    const response = await fetch('/api/workspace-history' + (before === null ? '' : '?before=' + before));
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Could not load workspace history');
+    workspaceLiveId = data.live.snapshotId;
+    workspaceSavedId = data.saved.snapshotId;
+    workspaceDiscoveryHealthy = data.discoveryHealthy;
+    workspaceSnapshotCursor = data.nextBefore;
+    const rows = before === null ? [data.live, data.saved, ...data.snapshots] : [...workspaceSnapshots, ...data.snapshots];
+    workspaceSnapshots = [...new Map(rows.filter(s => s.snapshotId).map(s => [s.snapshotId, s])).values()];
+    renderWorkspaceSnapshots();
+  } catch (e) {
+    body.innerHTML = '<div class="ws-modal-empty">Failed to load snapshots: ' + escapeHtml(String(e)) + '</div>';
+  } finally {
+    workspaceSnapshotsLoading = false;
+  }
+}
+
+function renderWorkspaceSnapshots() {
+    const body = document.getElementById('wsBackupsBody');
+    if (!workspaceSnapshots.length) {
       body.innerHTML = '<div class="ws-modal-empty">No workspace snapshots found.</div>';
       return;
     }
-    const html = snaps.map((snap, idx) => {
-      const isCurrent = snap.slot === 'current';
-      const label = isCurrent ? 'Last saved open tabs' : 'Open-tab backup .' + snap.slot;
+    const html = workspaceSnapshots.map((snap, idx) => {
+      const isCurrent = snap.snapshotId === workspaceSavedId;
+      const isLive = snap.snapshotId === workspaceLiveId;
+      const label = isLive ? (isCurrent ? 'Open now / Saved workspace' : 'Open now')
+        : isCurrent ? 'Saved workspace' : 'Workspace #' + snap.snapshotId;
       const tagClass = isCurrent ? 'current' : '';
-      const tagText = isCurrent ? 'SAVED' : '#' + snap.slot;
+      const tagText = snap.source === 'manual-save' ? 'MANUAL'
+        : snap.source === 'live' ? 'AUTO' : 'IMPORTED';
       const sessHtml = (snap.sessions || []).map(s => {
         const idShort = (s.sessionId || '').slice(0, 8);
         const summary = escapeHtml(s.summary || 'Untitled');
@@ -2360,11 +2392,11 @@ async function openWorkspaceBackups() {
         const branch = s.branch ? ' · ' + escapeHtml(s.branch) : '';
         return '<div class="ws-backup-sess"><code>' + idShort + '</code>' +
                '<span class="sess-summary">' + summary + '</span>' +
-               '<span>— ' + cwd + branch + '</span></div>';
+               '<span>— ' + cwd + branch + (s.available ? '' : ' (history or directory unavailable)') + '</span></div>';
       }).join('');
-      const promoteBtn = isCurrent
-        ? ''
-        : '<button class="ws-backup-btn primary" data-slot="' + snap.slot + '" data-action="promote">Add to recovery</button>';
+      const restoreBtn = snap.count
+        ? '<button class="ws-backup-btn primary" data-snapshot="' + snap.snapshotId + '" data-action="restore">Restore this group</button>'
+        : '';
       return '<div class="ws-backup-row ' + (isCurrent ? 'active' : '') + '" data-idx="' + idx + '">' +
         '<div class="ws-backup-head">' +
           '<div class="ws-backup-meta">' +
@@ -2374,55 +2406,53 @@ async function openWorkspaceBackups() {
             '<span class="ws-backup-time">' + (snap.savedAt ? timeAgo(snap.savedAt) + ' (' + new Date(snap.savedAt).toLocaleString() + ')' : 'unknown time') + '</span>' +
           '</div>' +
           '<div class="ws-backup-actions">' +
-            '<button class="ws-backup-btn" data-idx="' + idx + '" data-action="toggle">👁️ Sessions</button>' +
-            promoteBtn +
+            '<button class="ws-backup-btn" data-idx="' + idx + '" data-action="toggle">👁️ Preview sessions</button>' +
+            restoreBtn +
           '</div>' +
         '</div>' +
         '<div class="ws-backup-sessions" id="wsBackupSess-' + idx + '">' + (sessHtml || '<div class="ws-backup-sess">(none)</div>') + '</div>' +
       '</div>';
     }).join('');
-    body.innerHTML = '<p>Saved open-tab snapshots only. Older sessions remain in <a href="/recovery">Recovery</a>.</p>' + html;
+    body.innerHTML = '<p>Every confirmed membership change is preserved, including before tabs close. Manual saves survive restarts. Unchanged tabs do not create automatic duplicates.</p>' +
+      (workspaceDiscoveryHealthy ? '' : '<p>Process discovery is unavailable or stale. Open now shows the last confirmed set.</p>') +
+      '<p>Restore one group, not a union of older workspaces. Individual sessions remain in <a href="/recovery">Recovery</a>.</p>' + html +
+      (workspaceSnapshotCursor ? '<button class="ws-backup-btn" id="workspaceHistoryMore">Load older snapshots</button>' : '');
     body.querySelectorAll('button[data-action="toggle"]').forEach(b => {
       b.addEventListener('click', () => {
         const el = document.getElementById('wsBackupSess-' + b.dataset.idx);
         if (el) el.classList.toggle('open');
       });
     });
-    body.querySelectorAll('button[data-action="promote"]').forEach(b => {
+    body.querySelectorAll('button[data-action="restore"]').forEach(b => {
       b.addEventListener('click', async () => {
-        const slot = b.dataset.slot;
-        if (!confirm('Add sessions from backup .' + slot + ' to recovery? Existing recovery entries will be retained. No sessions will be launched.')) return;
+        const snapshotId = Number(b.dataset.snapshot);
+        const snapshot = workspaceSnapshots.find(s => s.snapshotId === snapshotId);
+        if (!snapshot || !confirm('Restore only these ' + snapshot.count + ' sessions from ' + new Date(snapshot.savedAt).toLocaleString() +
+          '? Already-running sessions will be skipped. The saved workspace will not be replaced.\\n\\n' +
+          snapshot.sessions.map(s => (s.summary || 'Untitled') + ' [' + s.sessionId.slice(0, 8) + ']').join('\\n'))) return;
         b.disabled = true;
-        b.textContent = 'Adding...';
+        b.textContent = 'Restoring...';
         try {
-          const resp = await fetch('/api/workspace-promote', {
+          const resp = await fetch('/api/restore-workspace-snapshot', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ slot: Number(slot) }),
+            body: JSON.stringify({ snapshotId }),
           });
           const data = await resp.json();
-          if (data.ok) {
-            showToast('Snapshot Added', data.count + ' sessions added to recovery. <a href="/recovery">Choose sessions to restore</a>.', 'success');
-            checkWorkspaceStatus();
-            openWorkspaceBackups(); // refresh list
-          } else {
-            showToast('❌ Promote Failed', data.error || '', 'error');
-            b.disabled = false;
-            b.textContent = 'Add to recovery';
-          }
+          if (!resp.ok) throw new Error(data.error || 'Restore failed');
+          void showRestoreProgress(data.results || []);
         } catch (e) {
-          showToast('❌ Promote Failed', String(e), 'error');
+          showToast('❌ Restore Failed', escapeHtml(String(e)), 'error');
+        } finally {
           b.disabled = false;
-          b.textContent = 'Add to recovery';
+          b.textContent = 'Restore this group';
         }
       });
     });
-  } catch (e) {
-    body.innerHTML = '<div class="ws-modal-empty">Failed to load snapshots: ' + escapeHtml(String(e)) + '</div>';
-  }
+    document.getElementById('workspaceHistoryMore')?.addEventListener('click', () => openWorkspaceBackups(workspaceSnapshotCursor));
 }
 
-document.getElementById('workspaceBackupsBtn').addEventListener('click', openWorkspaceBackups);
+document.getElementById('workspaceBackupsBtn').addEventListener('click', () => openWorkspaceBackups());
 document.getElementById('wsBackupsClose').addEventListener('click', () => {
   document.getElementById('wsBackupsModal').classList.remove('open');
 });
@@ -5510,6 +5540,41 @@ const server = createServer(async (req, res) => {
         return;
     }
     // --- Feature 12: Workspace save/restore ---
+    if (requestUrl.pathname === "/api/workspace-history" && req.method === "GET") {
+        try {
+            const history = recovery.workspaceHistory({
+                before: requestUrl.searchParams.has("before") ? Number(requestUrl.searchParams.get("before")) : null,
+                limit: requestUrl.searchParams.has("limit") ? Number(requestUrl.searchParams.get("limit")) : 50,
+            });
+            const describe = snapshot => ({
+                ...snapshot, sessions: snapshot.sessions.map(session => ({ ...session, available: recovery.canRestore(session) })),
+            });
+            const target = recovery.workspace();
+            const saved = target.snapshotId ? recovery.workspaceSnapshot(target.snapshotId) : target;
+            sendJson(res, {
+                ...history, snapshots: history.snapshots.map(describe),
+                live: describe(recovery.liveWorkspace()), saved: describe(saved),
+                discoveryHealthy: runtimeSnapshot.healthy && Date.now() - runtimeSnapshot.capturedAt < 25000,
+            });
+        } catch (error) { sendJson(res, { error: error.message }, 400); }
+        return;
+    }
+    if (requestUrl.pathname === "/api/restore-workspace-snapshot" && req.method === "POST") {
+        try {
+            const { snapshotId } = await requestJson(req);
+            const snapshot = recovery.workspaceSnapshot(snapshotId);
+            if (!snapshot) { sendJson(res, { error: "Workspace snapshot not found" }, 404); return; }
+            const available = snapshot.sessions.filter(session => recovery.canRestore(session));
+            const queued = available.length ? await queueRecovery(available.map(session => session.sessionId), available) : [];
+            const byId = new Map(queued.map(result => [result.id, result]));
+            sendJson(res, {
+                snapshotId, results: snapshot.sessions.map(session => byId.get(session.sessionId) || {
+                    id: session.sessionId, state: "failed", error: "Snapshot history or original working directory is unavailable",
+                }),
+            }, 202);
+        } catch (error) { sendJson(res, { error: error.message }, 400); }
+        return;
+    }
     if (req.url === "/api/workspace-status") {
         try {
             const workspace = recovery.workspace();

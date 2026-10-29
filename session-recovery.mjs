@@ -28,6 +28,10 @@ function sessionMetadata(session) {
     return result;
 }
 
+function workspaceMembership(sessions) {
+    return [...new Set(sessions.map(session => session.sessionId))].sort().join("\n");
+}
+
 function readJson(file) {
     return JSON.parse(readFileSync(file, "utf8"));
 }
@@ -217,6 +221,10 @@ export class RecoveryStore {
             CREATE TABLE IF NOT EXISTS checkpoints (
                 boot_id TEXT PRIMARY KEY, saved_at TEXT NOT NULL, payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS workspace_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, boot_id TEXT, saved_at TEXT NOT NULL,
+                source TEXT NOT NULL, payload TEXT NOT NULL
+            );
         `);
         this.transaction(() => {
             if (!this.meta("initialized")) {
@@ -262,31 +270,72 @@ export class RecoveryStore {
                 }
                 this.setMeta("open-tabs:initialized", "1");
             }
+            this.migrateWorkspaceHistory();
         });
         if (bootId) this.setBoot(bootId, bootStartedAt);
+    }
+
+    migrateWorkspaceHistory() {
+        if (this.meta("workspace-history:initialized")) return;
+        const snapshots = new Map();
+        const collect = (snapshot, source = "legacy-backup") => {
+            if (!snapshot || snapshot.version === 2 || !Array.isArray(snapshot.sessions)
+                || !Number.isFinite(Date.parse(snapshot.savedAt))) return null;
+            const sessions = [];
+            for (const session of snapshot.sessions) {
+                try { sessions.push(sessionMetadata(session)); } catch {}
+            }
+            // Never turn an unreadable historical group into a confirmed empty workspace.
+            if (snapshot.sessions.length && !sessions.length) return null;
+            const normalized = { ...snapshot, sessions, source, bootId: snapshot.bootId || null };
+            const key = JSON.stringify([normalized.bootId, normalized.savedAt, workspaceMembership(sessions)]);
+            snapshots.set(key, normalized);
+            return key;
+        };
+        for (let slot = 10; slot >= 0; slot--) {
+            try { collect(readJson(this.workspaceFile + (slot ? `.${slot}` : ""))); } catch {}
+        }
+        for (const checkpoint of this.checkpoints()) {
+            collect({ ...checkpoint.data, bootId: checkpoint.bootId }, "previous-boot");
+        }
+        const legacyLive = JSON.parse(this.meta("open-tabs:live") || "null");
+        const legacySaved = JSON.parse(this.meta("open-tabs:saved") || "null");
+        const liveKey = collect(legacyLive, "live");
+        const savedKey = collect(legacySaved, legacySaved?.source || "legacy-snapshot");
+        const ids = new Map();
+        for (const [key, snapshot] of [...snapshots].sort((a, b) => Date.parse(a[1].savedAt) - Date.parse(b[1].savedAt))) {
+            ids.set(key, this.recordWorkspace(snapshot).snapshotId);
+        }
+        if (liveKey) this.setMeta("workspace-history:live", String(ids.get(liveKey)));
+        if (savedKey) {
+            const target = legacySaved.source === "previous-boot" ? "previous" : "saved";
+            this.setMeta(`workspace-history:${target}`, String(ids.get(savedKey)));
+        }
+        const previousBoot = this.meta("open-tabs:boot") || legacyLive?.bootId;
+        if (previousBoot) this.setMeta("workspace-history:boot", previousBoot);
+        this.setMeta("workspace-history:initialized", "1");
     }
 
     setBoot(bootId, bootStartedAt = null) {
         if (!bootId) return;
         this.transaction(() => {
-            const previousBoot = this.meta("open-tabs:boot");
+            const previousBoot = this.meta("workspace-history:boot");
             if (previousBoot && previousBoot !== bootId) {
-                const live = JSON.parse(this.meta("open-tabs:live") || "null");
                 const sameBoot = Math.abs(Date.parse(previousBoot) - Date.parse(bootStartedAt)) < 60000;
-                if (sameBoot) {
-                    if (live?.bootId === previousBoot) this.setMeta("open-tabs:live", JSON.stringify({ ...live, bootId }));
-                } else {
-                    if (live?.bootId === previousBoot) {
+                if (!sameBoot) {
+                    const live = this.liveWorkspace();
+                    if (live.snapshotId) {
                         const saved = { ...live, version: 3, source: "previous-boot" };
-                        this.setMeta("open-tabs:saved", JSON.stringify(saved));
+                        this.setMeta("workspace-history:previous", String(live.snapshotId));
                         this.db.prepare("INSERT OR IGNORE INTO checkpoints VALUES (?, ?, ?)")
                             .run(previousBoot, saved.savedAt, JSON.stringify(saved));
                     }
+                    this.db.prepare("DELETE FROM metadata WHERE key IN ('workspace-history:live','workspace-history:captured-at')").run();
                     this.db.prepare("UPDATE roster SET state='interrupted', error='Computer restarted before restore confirmation' WHERE state IN ('queued','launching')").run();
-                    this.db.prepare("DELETE FROM metadata WHERE key='open-tabs:coordinator'").run();
+                    this.db.prepare("DELETE FROM metadata WHERE key='workspace-history:coordinator'").run();
                 }
             }
-            this.setMeta("open-tabs:boot", bootId);
+            this.setMeta("workspace-history:boot", bootId);
             this.bootId = bootId;
         });
     }
@@ -382,34 +431,86 @@ export class RecoveryStore {
     }
 
     observeWorkspace(runtime) {
-        if (!runtime?.healthy || runtime.bootId !== this.bootId || this.now() - runtime.capturedAt >= HEARTBEAT_TTL) return false;
-        this.transaction(() => {
+        if (!runtime?.healthy || !Array.isArray(runtime.processes) || !Number.isFinite(runtime.capturedAt)
+            || runtime.bootId !== this.bootId || this.now() - runtime.capturedAt >= HEARTBEAT_TTL) return false;
+        return this.transaction(() => {
+            if (this.meta("workspace-history:boot") !== runtime.bootId
+                || runtime.capturedAt < Number(this.meta("workspace-history:captured-at") || 0)) return false;
             const sessions = this.list().filter(row => this.canRestore(row.metadata)
                 && sessionPresence(this, row.id, runtime).alive).map(row => row.metadata);
-            const previous = JSON.parse(this.meta("open-tabs:live") || "null");
-            if (previous?.bootId !== this.bootId || JSON.stringify(previous.sessions) !== JSON.stringify(sessions)) {
-                this.setMeta("open-tabs:live", JSON.stringify({
-                    bootId: this.bootId, savedAt: new Date(this.now()).toISOString(), source: "live", sessions,
-                }));
+            const previous = this.liveWorkspace();
+            if (!previous.snapshotId || workspaceMembership(previous.sessions) !== workspaceMembership(sessions)) {
+                const snapshot = this.recordWorkspace({
+                    bootId: this.bootId, savedAt: new Date(runtime.capturedAt).toISOString(), source: "live", sessions,
+                });
+                this.setMeta("workspace-history:live", String(snapshot.snapshotId));
             }
+            this.setMeta("workspace-history:captured-at", String(runtime.capturedAt));
+            return true;
         });
-        return true;
     }
 
     saveWorkspace() {
-        const live = JSON.parse(this.meta("open-tabs:live") || "null");
-        if (!live || live.bootId !== this.bootId) throw new Error("No confirmed open-tab snapshot is available");
-        this.setMeta("open-tabs:saved", JSON.stringify({ ...live, source: "manual-save" }));
+        return this.transaction(() => {
+            const live = this.liveWorkspace();
+            if (!live.snapshotId || this.meta("workspace-history:boot") !== this.bootId) {
+                throw new Error("No confirmed open-tab snapshot is available");
+            }
+            const current = new Map(this.list().map(row => [row.id, row.metadata]));
+            const saved = this.recordWorkspace({
+                ...live, bootId: this.bootId, savedAt: new Date(this.now()).toISOString(), source: "manual-save",
+                sessions: live.sessions.map(session => current.get(session.sessionId) || session),
+            });
+            this.setMeta("workspace-history:saved", String(saved.snapshotId));
+            return saved;
+        });
+    }
+
+    recordWorkspace({ bootId = null, savedAt, source, sessions }) {
+        sessions = [...new Map(sessions.map(session => {
+            const metadata = sessionMetadata(session);
+            return [metadata.sessionId, metadata];
+        })).values()].sort((a, b) => a.sessionId.localeCompare(b.sessionId));
+        const result = this.db.prepare("INSERT INTO workspace_snapshots(boot_id,saved_at,source,payload) VALUES (?,?,?,?)")
+            .run(bootId, savedAt, source, JSON.stringify(sessions));
+        return { snapshotId: Number(result.lastInsertRowid), bootId, savedAt, source, sessions, count: sessions.length };
+    }
+
+    workspaceSnapshot(snapshotId) {
+        if (!Number.isSafeInteger(snapshotId) || snapshotId < 1) throw new Error("Invalid workspace snapshot ID");
+        const row = this.db.prepare("SELECT * FROM workspace_snapshots WHERE id=?").get(snapshotId);
+        if (!row) return null;
+        const sessions = JSON.parse(row.payload);
+        return { snapshotId: row.id, bootId: row.boot_id, savedAt: row.saved_at, source: row.source, sessions, count: sessions.length };
+    }
+
+    workspaceHistory({ before = null, limit = 50 } = {}) {
+        if ((before !== null && (!Number.isSafeInteger(before) || before < 1))
+            || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("Invalid workspace history page");
+        const rows = this.db.prepare("SELECT id FROM workspace_snapshots WHERE id<? ORDER BY id DESC LIMIT ?")
+            .all(before ?? Number.MAX_SAFE_INTEGER, limit + 1);
+        const snapshots = rows.slice(0, limit).map(row => this.workspaceSnapshot(row.id));
+        return { snapshots, nextBefore: rows.length > limit ? snapshots.at(-1).snapshotId : null };
+    }
+
+    liveWorkspace() {
+        const id = this.meta("workspace-history:live");
+        return (id && this.workspaceSnapshot(Number(id)))
+            || { snapshotId: null, savedAt: "", source: "none", bootId: this.bootId, sessions: [], count: 0 };
     }
 
     workspace() {
-        const saved = JSON.parse(this.meta("open-tabs:saved") || this.meta("open-tabs:live") || "null");
+        const savedId = this.meta("workspace-history:saved");
+        const previousId = this.meta("workspace-history:previous");
+        const saved = savedId ? this.workspaceSnapshot(Number(savedId))
+            : previousId ? { ...this.workspaceSnapshot(Number(previousId)), source: "previous-boot" } : this.liveWorkspace();
         const retained = new Map(this.list().map(row => [row.id, row.metadata]));
+        const sessions = (saved?.sessions || []).filter(session => retained.has(session.sessionId) && this.canRestore(session))
+            .map(session => ({ ...session, ...retained.get(session.sessionId) }))
+            .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
         return {
-            savedAt: saved?.savedAt || "", source: saved?.source || "none", bootId: saved?.bootId || null,
-            sessions: (saved?.sessions || []).filter(session => retained.has(session.sessionId) && this.canRestore(session))
-                .map(session => ({ ...session, ...retained.get(session.sessionId) }))
-                .sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
+            snapshotId: saved?.snapshotId || null, savedAt: saved?.savedAt || "", source: saved?.source || "none",
+            bootId: saved?.bootId || null, sessions, count: sessions.length,
         };
     }
 
@@ -425,9 +526,9 @@ export class RecoveryStore {
 
     claimCoordinator() {
         return this.transaction(() => {
-            const lease = JSON.parse(this.meta("open-tabs:coordinator") || "null");
+            const lease = JSON.parse(this.meta("workspace-history:coordinator") || "null");
             if (lease && lease.owner !== this.instanceId && lease.expiresAt > this.now()) return false;
-            this.setMeta("open-tabs:coordinator", JSON.stringify({ owner: this.instanceId, bootId: this.bootId, expiresAt: this.now() + LEASE_TTL }));
+            this.setMeta("workspace-history:coordinator", JSON.stringify({ owner: this.instanceId, bootId: this.bootId, expiresAt: this.now() + LEASE_TTL }));
             return true;
         });
     }

@@ -172,7 +172,139 @@ test("adopting a stable boot ID does not manufacture a reboot or replace the sav
     assert.deepEqual(before.workspace().sessions.map(s => s.sessionId), [id(1)]);
     assert.equal(before.checkpoints().length, 0);
     const after = f.store("windows-boot-56");
-    assert.deepEqual(after.workspace().sessions.map(s => s.sessionId), [id(2)]);
+    assert.deepEqual(after.workspace().sessions.map(s => s.sessionId), [id(1)], "a real reboot must also preserve the manual save");
+    assert.deepEqual(after.checkpoints().find(c => c.bootId === "windows-boot-55").data.sessions.map(s => s.sessionId), [id(2)]);
+});
+
+test("history records membership transitions, not repeated checks, metadata updates, ordering, or competing observers", t => {
+    const f = fixture(t), a = f.store(), b = f.store();
+    a.observe([f.session(1), f.session(2)]);
+    const firstRuntime = f.runtime([f.process(1), f.process(2)]);
+    a.observeWorkspace(firstRuntime);
+    const original = a.liveWorkspace();
+    for (let n = 0; n < 5; n++) {
+        f.advance(1);
+        b.observe([{ ...f.session(2), summary: "Renamed", branch: "changed" }]);
+        b.observeWorkspace(f.runtime([f.process(2), f.process(1)]));
+        a.observeWorkspace(f.runtime([f.process(1), f.process(2)]));
+    }
+    assert.deepEqual(a.liveWorkspace(), original, "the original timestamp and historical metadata remain immutable");
+    assert.equal(a.workspaceHistory().snapshots.length, 1);
+    f.advance(1);
+    a.observeWorkspace(f.runtime([f.process(2)]));
+    assert.equal(b.observeWorkspace(firstRuntime), false, "a late but otherwise fresh scan must not undo a newer observation");
+    assert.equal(b.observeWorkspace(f.runtime([], false)), false);
+    assert.equal(b.observeWorkspace({ ...f.runtime(), capturedAt: f.now() - 25000 }), false);
+    assert.equal(b.observeWorkspace({ ...f.runtime(), capturedAt: NaN }), false);
+    assert.equal(b.workspaceHistory().snapshots.length, 2);
+    f.advance(1);
+    b.observeWorkspace(f.runtime([f.process(1), f.process(2)]));
+    const snapshots = a.workspaceHistory().snapshots;
+    assert.deepEqual(snapshots.map(s => s.count), [2, 1, 2], "returning to an earlier set is a real transition, not a duplicate poll");
+    assert.notEqual(snapshots[0].snapshotId, original.snapshotId);
+    assert.deepEqual(f.store().workspaceHistory().snapshots, snapshots, "a new connection must not create another copy");
+});
+
+test("manual saves and every closure state survive cancelled shutdowns, empty workspaces, and actual reboots", t => {
+    const f = fixture(t), before = f.store();
+    before.observe([f.session(1), f.session(2)]);
+    before.observeWorkspace(f.runtime([f.process(1), f.process(2)]));
+    const original = before.liveWorkspace();
+    before.observe([{ sessionId: id(1), cwd: f.directory, summary: "Updated title" }]);
+    before.observeWorkspace(f.runtime([f.process(1), f.process(2)]));
+    const manual = before.saveWorkspace();
+    assert.equal(manual.sessions[0].summary, "Updated title", "explicit saves capture current metadata even without a membership change");
+    assert.deepEqual(before.workspaceSnapshot(original.snapshotId), original);
+    for (const processes of [[f.process(2)], [], [f.process(1), f.process(2)], []]) {
+        f.advance(1000);
+        before.observeWorkspace(f.runtime(processes));
+    }
+    assert.deepEqual(before.workspaceHistory().snapshots.map(s => s.count), [0, 2, 0, 1, 2, 2]);
+    const after = f.store("boot-b");
+    assert.deepEqual(after.workspaceSnapshot(manual.snapshotId), manual);
+    assert.equal(after.workspace().snapshotId, manual.snapshotId);
+    assert.equal(after.liveWorkspace().snapshotId, null, "a new boot has no confirmed current observation yet");
+    assert.equal(after.checkpoints().find(c => c.bootId === "boot-a").data.sessions.length, 0);
+    f.advance(1000);
+    after.observeWorkspace({ ...f.runtime([f.process(1)]), bootId: "boot-b" });
+    assert.equal(after.workspace().snapshotId, manual.snapshotId);
+    const replacement = after.saveWorkspace();
+    assert.equal(after.workspace().snapshotId, replacement.snapshotId);
+    assert.notEqual(replacement.snapshotId, manual.snapshotId);
+    assert.deepEqual(after.workspaceSnapshot(manual.snapshotId), manual, "replacing the save must retain the older saved group");
+    assert.equal(f.store("boot-b").workspace().snapshotId, replacement.snapshotId);
+});
+
+test("history migration preserves genuine groups and manual saves while isolating all pointers from legacy writers", t => {
+    const f = fixture(t), legacy = f.store();
+    const one = f.session(1), two = f.session(2), three = f.session(3);
+    legacy.observe([one, two, three]);
+    legacy.db.prepare("DELETE FROM metadata WHERE key LIKE 'workspace-history:%'").run();
+    const saved = { bootId: "boot-a", savedAt: "2030-01-02T11:00:00Z", source: "manual-save", sessions: [one, two] };
+    legacy.setMeta("open-tabs:boot", "boot-a");
+    legacy.setMeta("open-tabs:saved", JSON.stringify(saved));
+    legacy.setMeta("open-tabs:live", JSON.stringify({ ...saved, savedAt: "2030-01-02T11:30:00Z", source: "live", sessions: [two] }));
+    const earlier = { version: 3, bootId: "older-boot", savedAt: "2030-01-01T11:00:00Z", sessions: [one, { sessionId: id(99), cwd: f.directory }] };
+    writeFileSync(legacy.workspaceFile + ".1", JSON.stringify(earlier));
+    writeFileSync(legacy.workspaceFile + ".2", JSON.stringify(earlier));
+    writeFileSync(legacy.workspaceFile, JSON.stringify({ version: 2, savedAt: new Date(f.now()).toISOString(), sessions: [one, two, three] }));
+    const current = f.store();
+    const snapshots = current.workspaceHistory().snapshots;
+    assert.equal(snapshots.length, 3, "duplicate backups and archive projections must not become extra history groups");
+    assert.deepEqual(current.workspace().sessions.map(s => s.sessionId), [id(1), id(2)]);
+    assert.deepEqual(current.liveWorkspace().sessions.map(s => s.sessionId), [id(2)]);
+    assert.deepEqual(snapshots.at(-1).sessions.map(s => s.sessionId), [id(1), id(99)], "missing history must not erase a historical member");
+    legacy.setMeta("open-tabs:boot", "obsolete-boot");
+    legacy.setMeta("open-tabs:saved", JSON.stringify({ ...saved, sessions: [] }));
+    legacy.setMeta("open-tabs:live", JSON.stringify({ ...saved, sessions: [one, two, three] }));
+    legacy.setMeta("open-tabs:coordinator", JSON.stringify({ owner: "old-writer", expiresAt: f.now() + 45000 }));
+    current.setBoot("boot-a");
+    assert.equal(current.claimCoordinator(), true);
+    assert.deepEqual(f.store().workspaceHistory().snapshots, snapshots, "legacy metadata must never be re-imported");
+    assert.deepEqual(current.workspace().sessions.map(s => s.sessionId), [id(1), id(2)]);
+    current.observeWorkspace(f.runtime([f.process(2)]));
+    assert.equal(current.workspaceHistory().snapshots.length, 3, "the first unchanged check after migration must not append a copy");
+});
+
+test("history pagination stays stable across new snapshots and unavailable members remain in immutable previews", t => {
+    const f = fixture(t), store = f.store();
+    store.observe([f.session(1), f.session(2)]);
+    for (const processes of [[f.process(1)], [f.process(1), f.process(2)], [], [f.process(2)]]) {
+        f.advance(1);
+        store.observeWorkspace(f.runtime(processes));
+    }
+    const first = store.workspaceHistory({ limit: 2 });
+    assert.equal(first.snapshots.length, 2);
+    store.saveWorkspace();
+    const second = store.workspaceHistory({ before: first.nextBefore, limit: 2 });
+    assert.equal(second.nextBefore, null);
+    assert.deepEqual([...first.snapshots, ...second.snapshots].map(s => s.count), [1, 0, 2, 1]);
+    const group = second.snapshots[0];
+    rmSync(f.history(1));
+    store.forget(id(2));
+    assert.deepEqual(store.workspaceSnapshot(group.snapshotId), group);
+    assert.equal(store.canRestore(group.sessions[0]), false);
+    assert.throws(() => store.workspaceSnapshot("../bad"), /Invalid/);
+    assert.throws(() => store.workspaceHistory({ before: 0 }), /Invalid/);
+    assert.throws(() => store.workspaceHistory({ limit: 101 }), /Invalid/);
+});
+
+test("a failed pointer update rolls back the history row and observation timestamp together", t => {
+    const f = fixture(t), store = f.store();
+    store.observe([f.session(1), f.session(2)]);
+    store.observeWorkspace(f.runtime([f.process(1)]));
+    const original = store.liveWorkspace();
+    const capturedAt = store.meta("workspace-history:captured-at");
+    const setMeta = store.setMeta.bind(store);
+    t.mock.method(store, "setMeta", (key, value) => {
+        if (key === "workspace-history:live") throw new Error("Simulated write failure");
+        return setMeta(key, value);
+    });
+    f.advance(1);
+    assert.throws(() => store.observeWorkspace(f.runtime([f.process(2)])), /Simulated write failure/);
+    assert.deepEqual(store.liveWorkspace(), original);
+    assert.equal(store.meta("workspace-history:captured-at"), capturedAt);
+    assert.deepEqual(store.workspaceHistory().snapshots, [original]);
 });
 
 test("connections share membership and a single expiring coordinator lease", t => {

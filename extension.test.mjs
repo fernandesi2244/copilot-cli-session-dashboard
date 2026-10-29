@@ -100,6 +100,19 @@ await import(${JSON.stringify(new URL("./extension.mjs", import.meta.url).href)}
     const workspace = (await api("/api/workspace-status")).data;
     assert.equal(workspace.count, 1, "saved workspace must not count the archive or newly opened tabs");
     assert.equal(workspace.archiveCount, 2);
+    const initialHistory = (await api("/api/workspace-history")).data;
+    assert.deepEqual(initialHistory.live.sessions.map(s => s.sessionId), [id(1)]);
+    assert.deepEqual(initialHistory.saved.sessions.map(s => s.sessionId), [id(2)]);
+    const firstPage = (await api("/api/workspace-history?limit=1")).data;
+    const secondPage = (await api("/api/workspace-history?limit=1&before=" + firstPage.nextBefore)).data;
+    assert.equal(firstPage.snapshots.length, 1);
+    assert.equal(secondPage.snapshots.length, 1);
+    assert.notEqual(firstPage.snapshots[0].snapshotId, secondPage.snapshots[0].snapshotId);
+    assert.equal(secondPage.nextBefore, null);
+    assert.equal((await api("/api/workspace-history?limit=101")).status, 400);
+    assert.equal((await api("/api/restore-workspace-snapshot", { snapshotId: "../bad" })).status, 400);
+    assert.equal((await api("/api/restore-workspace-snapshot", { snapshotId: 99999 })).status, 404);
+    assert.equal((stdout.match(/FAKE_LAUNCH/g) || []).length, 0, "migration, history previews, and invalid selections must never launch tabs");
 
     const legacyArchive = {
         version: 2, savedAt: "2030-01-01T12:00:00Z",
@@ -120,6 +133,8 @@ await import(${JSON.stringify(new URL("./extension.mjs", import.meta.url).href)}
     assert.equal(snapshots.some(s => s.slot === 10), false, "merged recovery archives are not open-tab backups");
     assert.ok(snapshots.some(s => s.slot === 8), "keep genuine version 3 backups");
     assert.ok(snapshots.some(s => s.slot === 9), "keep genuine legacy version 1 backups");
+    assert.deepEqual((await api("/api/workspace-history")).data.snapshots, initialHistory.snapshots,
+        "repeated previews and legacy JSON writes cannot append or alter durable history");
 
     const page = await fetch(url + "/recovery").then(r => r.text());
     const browserScript = page.match(/<script>([\s\S]*?)<\/script>/)[1];
@@ -127,6 +142,52 @@ await import(${JSON.stringify(new URL("./extension.mjs", import.meta.url).href)}
     const main = await fetch(url).then(r => r.text());
     assert.match(main, /href="\/recovery"/);
     for (const match of main.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Script(match[1]);
+    const controls = [], browserRequests = [], confirmations = [];
+    let approved = false;
+    const modalBody = {
+        set innerHTML(html) {
+            this.html = html;
+            controls.length = 0;
+            for (const match of html.matchAll(/<button([^>]*)>/g)) {
+                controls.push({
+                    id: match[1].match(/\bid="([^"]*)"/)?.[1],
+                    dataset: Object.fromEntries([...match[1].matchAll(/data-(\w+)="([^"]*)"/g)].map(m => [m[1], m[2]])),
+                    addEventListener(event, handler) { this[event] = handler; },
+                });
+            }
+        },
+        querySelectorAll(selector) { return controls.filter(c => selector.includes('"' + c.dataset.action + '"')); },
+    };
+    const browser = {
+        document: { getElementById(name) {
+            if (name === "wsBackupsBody") return modalBody;
+            if (name === "wsBackupsModal") return { classList: { add() {} } };
+            return controls.find(c => c.id === name);
+        } },
+        escapeHtml: value => String(value), timeAgo: () => "earlier",
+        confirm(message) { confirmations.push(message); return approved; },
+        showToast() { assert.fail("Unexpected snapshot browser error"); },
+        showRestoreProgress(results) { assert.equal(results[0].state, "already-running"); },
+        async fetch(path, options) {
+            browserRequests.push({ path, options });
+            return { ok: true, json: async () => options
+                ? { results: [{ id: id(2), state: "already-running" }] }
+                : { ...initialHistory, snapshots: initialHistory.snapshots, nextBefore: null } };
+        },
+    };
+    const historyScript = main.match(/let workspaceSnapshots = \[\];[\s\S]*?(?=document\.getElementById\('workspaceBackupsBtn'\))/)[0];
+    new Script(historyScript).runInNewContext(browser);
+    await browser.openWorkspaceBackups();
+    assert.equal((modalBody.html.match(/class="ws-backup-row /g) || []).length, initialHistory.snapshots.length,
+        "pinning the live and saved groups must not render duplicate history cards");
+    const restoreButton = controls.find(c => c.dataset.snapshot === String(initialHistory.saved.snapshotId));
+    await restoreButton.click();
+    assert.equal(browserRequests.length, 1, "declining the preview confirmation must not send a restore request");
+    approved = true;
+    await restoreButton.click();
+    assert.match(confirmations.at(-1), /Restore only these 1 sessions/);
+    assert.equal(browserRequests.at(-1).path, "/api/restore-workspace-snapshot");
+    assert.deepEqual(JSON.parse(browserRequests.at(-1).options.body), { snapshotId: initialHistory.saved.snapshotId });
     const localDayRange = browserScript.match(/function localDayRange\(value\) \{[\s\S]*?^\}/m)[0];
     const lengths = JSON.parse(execFileSync(process.execPath, ["-e", localDayRange + `
 console.log(JSON.stringify(['2024-03-10','2024-11-03'].map(day => {
@@ -160,10 +221,15 @@ console.log(JSON.stringify(['2024-03-10','2024-11-03'].map(day => {
     assert.match(status.error, /Simulated terminal launch failure/);
     assert.equal((stdout.match(/FAKE_LAUNCH/g) || []).length, 1, "all resume routes must share one attempt");
     assert.equal((await api("/api/recovery")).data.sessions.find(s => s.sessionId === id(3)).cwd, cwd);
-    const restored = await api("/api/restore-workspace", {});
+    const [restored, historicalRestore] = await Promise.all([
+        api("/api/restore-workspace", {}),
+        api("/api/restore-workspace-snapshot", { snapshotId: initialHistory.saved.snapshotId }),
+    ]);
     assert.equal(restored.status, 202);
     assert.equal(restored.data.restored, undefined, "a queued launch must never be reported as restored");
     assert.deepEqual(restored.data.results.map(r => r.id), [id(2)], "bulk restore must not launch unrelated archived sessions");
+    assert.equal(historicalRestore.status, 202);
+    assert.deepEqual(historicalRestore.data.results.map(r => r.id), [id(2)], "snapshot restore must use only the selected group");
     const saved = await api("/api/save-workspace", {});
     assert.equal(saved.data.count, 1, "manual save must use the currently open tabs, not the archive");
     assert.equal((await api("/api/recovery")).data.sessions.length, 3, "manual save must preserve older archive entries");
@@ -173,6 +239,12 @@ console.log(JSON.stringify(['2024-03-10','2024-11-03'].map(day => {
     assert.deepEqual(savedSnapshot.sessions.map(s => s.sessionId), [id(1)], "the saved list must reflect the newly saved open tabs");
     const currentRestore = await api("/api/restore-workspace", {});
     assert.deepEqual(currentRestore.data.results.map(r => [r.id, r.state]), [[id(1), "already-running"]]);
+    const savedHistory = (await api("/api/workspace-history")).data;
+    assert.equal(savedHistory.saved.source, "manual-save");
+    assert.notEqual(savedHistory.saved.snapshotId, initialHistory.saved.snapshotId);
+    assert.ok(savedHistory.snapshots.some(s => s.snapshotId === initialHistory.saved.snapshotId), "manual save must not replace historical groups");
+    const snapshotRestore = await api("/api/restore-workspace-snapshot", { snapshotId: savedHistory.saved.snapshotId });
+    assert.deepEqual(snapshotRestore.data.results.map(r => [r.id, r.state]), [[id(1), "already-running"]]);
 
     await api("/api/recovery/forget", { sessionIds: [id(3)] });
     assert.equal(existsSync(join(directory, "session-state", id(3), "events.jsonl")), true);
@@ -188,4 +260,13 @@ console.log(JSON.stringify(['2024-03-10','2024-11-03'].map(day => {
     assert.equal((await api("/api/save-workspace", {})).data.count, 0, "live scans must respect explicit forgetting");
     assert.equal((await api("/api/workspace-status")).data.hasSaved, false);
     assert.equal(JSON.parse(readFileSync(join(directory, "saved-workspace.json"))).sessions.length, 0);
+    rmSync(join(directory, "session-state", id(2), "events.jsonl"));
+    const finalHistory = (await api("/api/workspace-history")).data;
+    const unavailable = finalHistory.snapshots.find(s => s.snapshotId === initialHistory.saved.snapshotId);
+    assert.deepEqual(unavailable.sessions.map(s => [s.sessionId, s.available]), [[id(2), false]]);
+    const unavailableRestore = await api("/api/restore-workspace-snapshot", { snapshotId: unavailable.snapshotId });
+    assert.deepEqual(unavailableRestore.data.results.map(r => [r.id, r.state]), [[id(2), "failed"]]);
+    assert.match(unavailableRestore.data.results[0].error, /unavailable/);
+    assert.equal(finalHistory.saved.count, 0);
+    assert.deepEqual((await api("/api/restore-workspace-snapshot", { snapshotId: finalHistory.saved.snapshotId })).data.results, []);
 });
