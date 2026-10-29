@@ -90,7 +90,7 @@ let registeredSessionId = null;
 const discoveredRecoveries = new Map();
 
 async function refreshRuntime() {
-    const shared = recovery.meta("workspace-runtime");
+    const shared = recovery.meta("open-tabs:runtime");
     if (shared) {
         const snapshot = JSON.parse(shared);
         if (Date.now() - snapshot.capturedAt < 10000) runtimeSnapshot = snapshot;
@@ -99,10 +99,10 @@ async function refreshRuntime() {
     if (runtimeRefresh) return runtimeRefresh;
     runtimeRefresh = readRuntimeProcesses().then(snapshot => {
         runtimeSnapshot = snapshot;
-        recovery.setBoot(snapshot.bootId);
+        recovery.setBoot(snapshot.bootId, snapshot.bootStartedAt);
         if (mainSession && registeredSessionId !== mainSession.sessionId) registerRecoverySession();
         // Share identity evidence, never arbitrary process arguments.
-        recovery.setMeta("workspace-runtime", JSON.stringify(shareRuntime(snapshot)));
+        recovery.setMeta("open-tabs:runtime", JSON.stringify(shareRuntime(snapshot)));
         return runtimeSnapshot;
     }).catch(error => {
         runtimeSnapshot = { ...runtimeSnapshot, healthy: false };
@@ -127,7 +127,7 @@ async function recoveryTick() {
     recoveryTickRunning = true;
     try {
         if (!recovery.claimCoordinator()) {
-            const shared = recovery.meta("workspace-runtime");
+            const shared = recovery.meta("open-tabs:runtime");
             if (shared) runtimeSnapshot = JSON.parse(shared);
             return;
         }

@@ -148,6 +148,8 @@ test("reboot freezes only the last confirmed open tabs while newer tabs and old 
     assert.deepEqual(after.workspace().sessions.map(s => s.sessionId), [id(2)]);
     after.observeWorkspace({ ...f.runtime([f.process(3)]), bootId: "boot-b" });
     after.setMeta("boot", "old-writer-boot");
+    after.setMeta("workspace-boot", "old-writer-boot");
+    after.setMeta("saved-workspace", JSON.stringify({ sessions: [] }));
     after.setMeta("coordinator", JSON.stringify({ owner: "old-writer", expiresAt: f.now() + 45000 }));
     after.setBoot("boot-b");
     assert.equal(after.claimCoordinator(), true, "old coordinators must not block live-workspace capture");
@@ -158,6 +160,19 @@ test("reboot freezes only the last confirmed open tabs while newer tabs and old 
     assert.equal(after.checkpoints().find(c => c.bootId === "boot-a").data.sessions.length, 1, "forgetting cannot mutate the checkpoint");
     const next = f.store("boot-c");
     assert.deepEqual(next.workspace().sessions.map(s => s.sessionId), [id(3)], "the next boot uses its immediately preceding live workspace");
+});
+
+test("adopting a stable boot ID does not manufacture a reboot or replace the saved workspace", t => {
+    const f = fixture(t), legacyBoot = "2030-01-02T08:00:04Z", before = f.store(legacyBoot);
+    before.observe([f.session(1), f.session(2)]);
+    before.observeWorkspace({ ...f.runtime([f.process(1)]), bootId: legacyBoot });
+    before.saveWorkspace();
+    before.observeWorkspace({ ...f.runtime([f.process(2)]), bootId: legacyBoot });
+    before.setBoot("windows-boot-55", "2030-01-02T08:00:00Z");
+    assert.deepEqual(before.workspace().sessions.map(s => s.sessionId), [id(1)]);
+    assert.equal(before.checkpoints().length, 0);
+    const after = f.store("windows-boot-56");
+    assert.deepEqual(after.workspace().sessions.map(s => s.sessionId), [id(2)]);
 });
 
 test("connections share membership and a single expiring coordinator lease", t => {

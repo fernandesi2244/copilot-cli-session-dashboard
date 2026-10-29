@@ -241,7 +241,7 @@ export class RecoveryStore {
                 }
                 this.setMeta("baseline-created", "1");
             }
-            if (!this.meta("workspace-separated")) {
+            if (!this.meta("open-tabs:initialized")) {
                 const snapshots = [];
                 for (let slot = 0; slot <= 10; slot++) {
                     try {
@@ -255,33 +255,38 @@ export class RecoveryStore {
                 snapshots.sort((a, b) => Date.parse(b.savedAt) - Date.parse(a.savedAt));
                 if (snapshots.length) {
                     const snapshot = { ...snapshots[0], source: "legacy-snapshot" };
-                    this.setMeta("saved-workspace", JSON.stringify(snapshot));
+                    this.setMeta("open-tabs:saved", JSON.stringify(snapshot));
                     if (bootId && Date.parse(snapshot.savedAt) >= Date.parse(bootStartedAt)) {
-                        this.setMeta("live-workspace", JSON.stringify({ ...snapshot, bootId }));
+                        this.setMeta("open-tabs:live", JSON.stringify({ ...snapshot, bootId }));
                     }
                 }
-                this.setMeta("workspace-separated", "1");
+                this.setMeta("open-tabs:initialized", "1");
             }
         });
-        if (bootId) this.setBoot(bootId);
+        if (bootId) this.setBoot(bootId, bootStartedAt);
     }
 
-    setBoot(bootId) {
+    setBoot(bootId, bootStartedAt = null) {
         if (!bootId) return;
         this.transaction(() => {
-            const previousBoot = this.meta("workspace-boot") || this.meta("boot");
+            const previousBoot = this.meta("open-tabs:boot");
             if (previousBoot && previousBoot !== bootId) {
-                const live = JSON.parse(this.meta("live-workspace") || "null");
-                if (live?.bootId === previousBoot) {
-                    const saved = { ...live, version: 3, source: "previous-boot" };
-                    this.setMeta("saved-workspace", JSON.stringify(saved));
-                    this.db.prepare("INSERT OR IGNORE INTO checkpoints VALUES (?, ?, ?)")
-                        .run(previousBoot, saved.savedAt, JSON.stringify(saved));
+                const live = JSON.parse(this.meta("open-tabs:live") || "null");
+                const sameBoot = Math.abs(Date.parse(previousBoot) - Date.parse(bootStartedAt)) < 60000;
+                if (sameBoot) {
+                    if (live?.bootId === previousBoot) this.setMeta("open-tabs:live", JSON.stringify({ ...live, bootId }));
+                } else {
+                    if (live?.bootId === previousBoot) {
+                        const saved = { ...live, version: 3, source: "previous-boot" };
+                        this.setMeta("open-tabs:saved", JSON.stringify(saved));
+                        this.db.prepare("INSERT OR IGNORE INTO checkpoints VALUES (?, ?, ?)")
+                            .run(previousBoot, saved.savedAt, JSON.stringify(saved));
+                    }
+                    this.db.prepare("UPDATE roster SET state='interrupted', error='Computer restarted before restore confirmation' WHERE state IN ('queued','launching')").run();
+                    this.db.prepare("DELETE FROM metadata WHERE key='open-tabs:coordinator'").run();
                 }
-                this.db.prepare("UPDATE roster SET state='interrupted', error='Computer restarted before restore confirmation' WHERE state IN ('queued','launching')").run();
-                this.db.prepare("DELETE FROM metadata WHERE key='workspace-coordinator'").run();
             }
-            this.setMeta("workspace-boot", bootId);
+            this.setMeta("open-tabs:boot", bootId);
             this.bootId = bootId;
         });
     }
@@ -381,9 +386,9 @@ export class RecoveryStore {
         this.transaction(() => {
             const sessions = this.list().filter(row => this.canRestore(row.metadata)
                 && sessionPresence(this, row.id, runtime).alive).map(row => row.metadata);
-            const previous = JSON.parse(this.meta("live-workspace") || "null");
+            const previous = JSON.parse(this.meta("open-tabs:live") || "null");
             if (previous?.bootId !== this.bootId || JSON.stringify(previous.sessions) !== JSON.stringify(sessions)) {
-                this.setMeta("live-workspace", JSON.stringify({
+                this.setMeta("open-tabs:live", JSON.stringify({
                     bootId: this.bootId, savedAt: new Date(this.now()).toISOString(), source: "live", sessions,
                 }));
             }
@@ -392,13 +397,13 @@ export class RecoveryStore {
     }
 
     saveWorkspace() {
-        const live = JSON.parse(this.meta("live-workspace") || "null");
+        const live = JSON.parse(this.meta("open-tabs:live") || "null");
         if (!live || live.bootId !== this.bootId) throw new Error("No confirmed open-tab snapshot is available");
-        this.setMeta("saved-workspace", JSON.stringify({ ...live, source: "manual-save" }));
+        this.setMeta("open-tabs:saved", JSON.stringify({ ...live, source: "manual-save" }));
     }
 
     workspace() {
-        const saved = JSON.parse(this.meta("saved-workspace") || this.meta("live-workspace") || "null");
+        const saved = JSON.parse(this.meta("open-tabs:saved") || this.meta("open-tabs:live") || "null");
         const retained = new Map(this.list().map(row => [row.id, row.metadata]));
         return {
             savedAt: saved?.savedAt || "", source: saved?.source || "none", bootId: saved?.bootId || null,
@@ -420,9 +425,9 @@ export class RecoveryStore {
 
     claimCoordinator() {
         return this.transaction(() => {
-            const lease = JSON.parse(this.meta("workspace-coordinator") || "null");
+            const lease = JSON.parse(this.meta("open-tabs:coordinator") || "null");
             if (lease && lease.owner !== this.instanceId && lease.expiresAt > this.now()) return false;
-            this.setMeta("workspace-coordinator", JSON.stringify({ owner: this.instanceId, bootId: this.bootId, expiresAt: this.now() + LEASE_TTL }));
+            this.setMeta("open-tabs:coordinator", JSON.stringify({ owner: this.instanceId, bootId: this.bootId, expiresAt: this.now() + LEASE_TTL }));
             return true;
         });
     }
